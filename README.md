@@ -59,13 +59,29 @@ The script generates a bearer token if one doesn't exist, writes and enables bot
 turns on lingering so they survive a reboot, and runs `tailscale serve`. It prints the URL to open.
 Re-run it after changing ports or pulling updates.
 
-Pick ports with `CBT_PORT` and `CBT_UPSTREAM_PORT` if the defaults clash:
+Pick ports if the defaults clash — `CBT_PORT` and `CBT_UPSTREAM_PORT` are local listeners,
+`TS_PORT` is the tailnet-facing HTTPS port:
 
 ```bash
-CBT_PORT=9100 CBT_UPSTREAM_PORT=9101 ./install.sh
+CBT_PORT=9100 CBT_UPSTREAM_PORT=9101 ./install.sh   # local ports
+TS_PORT=8443 ./install.sh                           # if 443 is already in use on this node
 ```
 
-Then open the `https://<host>.<tailnet>.ts.net` URL on your phone and **Add to Home Screen**.
+`tailscale serve` replaces an existing mapping without asking, so if you already serve something
+else on 443 it would go offline. The installer checks first and refuses rather than clobbering it.
+
+Then open the URL printed by the installer — **including the port** — on your phone and
+**Add to Home Screen**.
+
+### Changing ports later
+
+`https://host` and `https://host:8443` are *different browser origins*. After a port change:
+
+- Re-add the home-screen icon from the new URL; the old one points at the old origin.
+- Clear site data for the old origin (Chrome → Site settings → the host → Clear & reset).
+  The service worker installed there stays registered and keeps intercepting requests for
+  whatever now serves that origin.
+- View preference and the cached snapshot live in `localStorage`, so they don't carry over.
 
 ## Configuration
 
@@ -79,6 +95,8 @@ Read from `~/.config/codexbar/dashboard.env` (mode 600):
 | `CBT_UPSTREAM_PORT` | `8087` | Where `codexbar serve` listens |
 | `CBT_CACHE_TTL` | `60` | Snapshot cache seconds |
 | `CBT_UPSTREAM_TIMEOUT` | `90` | Upstream deadline; keep above `serve --request-timeout` |
+
+`TS_PORT` (default `443`) is read by `install.sh` only, not by the server.
 
 Which providers appear is entirely CodexBar's config (`~/.config/codexbar/config.json`):
 
