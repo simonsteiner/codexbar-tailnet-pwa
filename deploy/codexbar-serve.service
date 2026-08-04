@@ -1,0 +1,14 @@
+[Unit]
+Description=CodexBar usage HTTP server (loopback)
+After=network-online.target
+
+[Service]
+Type=simple
+# Token comes from the environment, never argv, so it stays out of `ps`.
+EnvironmentFile=%h/.config/codexbar/dashboard.env
+ExecStart=__CODEXBAR__ serve --host 127.0.0.1 --port __UPSTREAM_PORT__ --refresh-interval 60 --request-timeout 45
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=default.target

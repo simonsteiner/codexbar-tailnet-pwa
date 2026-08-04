@@ -1,0 +1,19 @@
+[Unit]
+Description=CodexBar tailnet PWA (static UI + authenticated snapshot proxy)
+After=codexbar-serve.service
+Wants=codexbar-serve.service
+
+[Service]
+Type=simple
+EnvironmentFile=%h/.config/codexbar/dashboard.env
+Environment=CBT_PORT=__PORT__
+Environment=CBT_BIND=127.0.0.1
+Environment=CBT_UPSTREAM_PORT=__UPSTREAM_PORT__
+Environment=CBT_CACHE_TTL=60
+WorkingDirectory=__APP_DIR__
+ExecStart=__NODE__ __APP_DIR__/server.mjs
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=default.target
