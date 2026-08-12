@@ -3,21 +3,57 @@
 
 const REFRESH_MS = 60_000;
 const VIEW_KEY = "codexbar.view";
+const LAST_KEY = "codexbar.last";
+const VERSION_KEY = "codexbar.version";
 
 const el = {
   content: document.getElementById("content"),
   status: document.getElementById("status"),
   meta: document.getElementById("meta"),
+  about: document.getElementById("about"),
   refresh: document.getElementById("refresh"),
 };
 
 let snapshot = null;
 let view = localStorage.getItem(VIEW_KEY) ?? "cards";
 let ticking = null;
+let loading = false;
+let recheck = null;
+let updating = false;
+let shellStamp = null;
+
+// Spin for the whole refresh cycle, not just the fetch: a warm proxy answers in
+// ~2 ms, so tying the spinner to the request alone makes it an invisible flash.
+const syncSpinner = () => el.refresh.classList.toggle("spinning", loading || updating);
+
+// The proxy answers stale hits instantly and refreshes in the background
+// (X-Snapshot-Refreshing). Re-poll on a short fuse until the fresh data lands.
+function scheduleRecheck() {
+  if (recheck) return;
+  recheck = setTimeout(() => {
+    recheck = null;
+    load();
+  }, 4000);
+}
 
 /* ---------------- helpers ---------------- */
 
 const severity = (pct) => (pct >= 90 ? "crit" : pct >= 75 ? "warn" : "ok");
+
+// The reserve: headroom left in a window, which is the number you plan around. dashboard-v1
+// reports it directly; deriving it from usedPercent is only the fallback, since a provider
+// that meters remaining separately needn't have the two add up to 100.
+const reserve = (w) => Math.max(0, Math.round(w.remainingPercent ?? 100 - w.usedPercent));
+
+/** Remaining credit balance for a provider, or null if it doesn't report one. */
+function creditsLeft(p) {
+  if (p.credits?.remaining == null) return null;
+  const n = Number(p.credits.remaining);
+  return {
+    value: Number.isFinite(n) ? n.toLocaleString() : String(p.credits.remaining),
+    unit: p.credits.unit ?? "credits",
+  };
+}
 
 function countdown(iso) {
   if (!iso) return null;
@@ -86,15 +122,19 @@ function renderCards(snap) {
         <div class="win">
           <div class="win-top">
             <span class="win-label">${esc(w.label ?? w.kind ?? "Window")}</span>
-            <span class="mono t-${sev}">${pct}%${cd ? ` · ${cd}` : ""}</span>
+            <span class="mono">
+              <b class="t-${sev}">${reserve(w)}% left</b>
+              <span class="win-sub">${pct}% used${cd ? ` · ${cd}` : ""}</span>
+            </span>
           </div>
           <div class="bar"><i class="fill-${sev}" style="width:${Math.min(pct, 100)}%"></i></div>
         </div>`;
     }).join("");
 
     const foot = [];
-    if (p.credits?.remaining != null) {
-      foot.push(`<span><b>${p.credits.remaining}</b> ${esc(p.credits.unit ?? "credits")}</span>`);
+    const credits = creditsLeft(p);
+    if (credits) {
+      foot.push(`<span><b>${esc(credits.value)}</b> ${esc(credits.unit)} left</span>`);
     }
     if (p.cost?.todayUSD != null) foot.push(`<span>today <b>${money(p.cost.todayUSD)}</b></span>`);
     if (p.cost?.last30DaysUSD != null) foot.push(`<span>30d <b>${money(p.cost.last30DaysUSD)}</b></span>`);
@@ -118,12 +158,23 @@ function renderResets(snap) {
   const rows = allWindows(snap).filter((r) => r.win.resetAt);
   if (!rows.length) return `<p class="empty">No reset windows reported.</p>`;
 
+  // Credits are per provider, not per window; show them once, on its soonest-resetting row.
+  const creditsShown = new Set();
+
   return rows.map(({ provider, win }) => {
     const pct = Math.round(win.usedPercent);
     const sev = severity(pct);
     const accent = provider.display?.accentColor ?? "#6e5aff";
     const when = new Date(win.resetAt);
     const local = when.toLocaleString([], { weekday: "short", hour: "2-digit", minute: "2-digit" });
+
+    const key = provider.id ?? provider.name;
+    let credits = null;
+    if (!creditsShown.has(key)) {
+      credits = creditsLeft(provider);
+      if (credits) creditsShown.add(key);
+    }
+
     return `
       <section class="reset-row">
         <div class="reset-who">
@@ -132,7 +183,9 @@ function renderResets(snap) {
           <span class="reset-sub">· ${esc(win.label ?? win.kind ?? "")}</span>
         </div>
         <div class="reset-when mono t-${sev}">${countdown(win.resetAt) ?? "—"}</div>
-        <div class="reset-sub mono">${pct}% used · resets ${esc(local)}</div>
+        <div class="reset-sub mono"><b class="t-${sev}">${reserve(win)}% left</b> · ${pct}% used</div>
+        <div class="reset-sub reset-foot mono">resets ${esc(local)}${
+          credits ? ` · ${esc(credits.value)} ${esc(credits.unit)} left` : ""}</div>
         <div class="bar reset-bar"><i class="fill-${sev}" style="width:${Math.min(pct, 100)}%"></i></div>
       </section>`;
   }).join("");
@@ -141,7 +194,10 @@ function renderResets(snap) {
 function renderDense(snap) {
   const rows = allWindows(snap);
   const failed = (snap.providers ?? []).filter((p) => p.error && !(p.windows ?? []).length);
-  if (!rows.length && !failed.length) return `<p class="empty">Nothing to show.</p>`;
+  const credited = (snap.providers ?? [])
+    .map((p) => ({ p, credits: creditsLeft(p) }))
+    .filter((x) => x.credits);
+  if (!rows.length && !failed.length && !credited.length) return `<p class="empty">Nothing to show.</p>`;
 
   const body = rows.map(({ provider, win }) => {
     const pct = Math.round(win.usedPercent);
@@ -151,11 +207,21 @@ function renderDense(snap) {
       <div class="drow">
         <span class="pdot" style="background:${esc(accent)}"></span>
         <span class="dname">${esc(provider.name ?? provider.id)}
-          <span class="dwin">${esc(win.label ?? win.kind ?? "")}</span></span>
-        <span class="dpct mono t-${sev}">${pct}%</span>
+          <span class="dwin">${esc(win.label ?? win.kind ?? "")} · ${pct}% used</span></span>
+        <span class="dpct mono t-${sev}">${reserve(win)}%<span class="dsuf">left</span></span>
         <span class="dreset mono">${countdown(win.resetAt) ?? "—"}</span>
       </div>`;
   }).join("");
+
+  // Credit balances don't belong to any one window, so they get their own rows.
+  const creds = credited.map(({ p, credits }) => `
+      <div class="drow">
+        <span class="pdot" style="background:${esc(p.display?.accentColor ?? "#6e5aff")}"></span>
+        <span class="dname">${esc(p.name ?? p.id)}
+          <span class="dwin">${esc(credits.unit)}</span></span>
+        <span class="dpct mono">${esc(credits.value)}<span class="dsuf">left</span></span>
+        <span class="dreset mono"></span>
+      </div>`).join("");
 
   const errs = failed.map((p) => `
       <div class="drow">
@@ -164,7 +230,7 @@ function renderDense(snap) {
         <span class="dpct t-crit" style="grid-column: 3 / -1; text-align:right; font-size:12px;">failed</span>
       </div>`).join("");
 
-  return `<div class="dense">${body}${errs}</div>`;
+  return `<div class="dense">${body}${creds}${errs}</div>`;
 }
 
 /* ---------------- shell ---------------- */
@@ -179,8 +245,9 @@ function render() {
   const age = gen ? Date.now() - gen.getTime() : 0;
   el.meta.textContent = gen
     ? `updated ${gen.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}` +
-      (snapshot.host?.codexBarVersion ? ` · CodexBar ${snapshot.host.codexBarVersion}` : "")
-    : "";
+      (snapshot.host?.codexBarVersion ? ` · CodexBar ${snapshot.host.codexBarVersion}` : "") +
+      (updating ? " · updating…" : "")
+    : updating ? "updating…" : "";
 
   if (gen && age > staleAfter) {
     show(`Snapshot is ${Math.round(age / 60000)}m old — is the WSL box awake?`, false);
@@ -194,25 +261,84 @@ function show(msg, isError) {
 }
 const hide = () => { el.status.hidden = true; };
 
-async function load({ manual = false } = {}) {
-  if (manual) el.refresh.classList.add("spinning");
+/** Last snapshot we rendered, or null if there isn't one or it didn't survive. */
+function readCached() {
+  const raw = localStorage.getItem(LAST_KEY);
+  if (!raw) return null;
+  try {
+    return JSON.parse(raw);
+  } catch {
+    localStorage.removeItem(LAST_KEY);
+    return null;
+  }
+}
+
+async function load() {
+  if (loading) return;
+  loading = true;
+  syncSpinner();
+  el.content.setAttribute("aria-busy", "true");
+  // Cold start with nothing cached: say so rather than showing an empty page.
+  if (!snapshot) el.content.innerHTML = `<p class="empty">Loading…</p>`;
   try {
     const res = await fetch("/api/snapshot", { cache: "no-store" });
     if (!res.ok) throw new Error(`snapshot ${res.status}`);
     snapshot = await res.json();
-    localStorage.setItem("codexbar.last", JSON.stringify(snapshot));
+    localStorage.setItem(LAST_KEY, JSON.stringify(snapshot));
+    updating = res.headers.get("X-Snapshot-Refreshing") === "true";
+    if (updating) scheduleRecheck();
     if (res.headers.get("X-Snapshot-Stale") === "true") {
       show("Showing last good data — the latest refresh failed.", false);
     } else hide();
     render();
   } catch (err) {
     // Offline or the box is down: fall back to whatever we last saw.
-    const cached = localStorage.getItem("codexbar.last");
-    if (cached && !snapshot) { snapshot = JSON.parse(cached); render(); }
+    updating = false;
+    if (!snapshot) {
+      snapshot = readCached();
+      if (snapshot) render();
+      else el.content.innerHTML = `<p class="empty">No snapshot yet.</p>`;
+    }
     show(`Can't reach CodexBar (${err.message}). Is Tailscale connected?`, true);
   } finally {
-    el.refresh.classList.remove("spinning");
+    loading = false;
+    syncSpinner();
+    el.content.setAttribute("aria-busy", "false");
   }
+}
+
+/** Footer credit: repo link plus the commit this build was served from. */
+function renderAbout(v) {
+  if (!v?.repo) return;
+  const name = v.repo.split("/").pop();
+  const repoLink = `<a href="${esc(v.repo)}" target="_blank" rel="noopener noreferrer">${esc(name)}</a>`;
+  const commitUrl = `${esc(v.repo)}/commit/${esc(v.commit)}`;
+  const hashLink = v.short
+    ? ` · <a class="mono" href="${commitUrl}" target="_blank" rel="noopener noreferrer">${esc(v.short)}</a>`
+    : "";
+  el.about.innerHTML = repoLink + hashLink;
+}
+
+async function loadVersion() {
+  // Cached so an offline launch still says which build is installed.
+  try { renderAbout(JSON.parse(localStorage.getItem(VERSION_KEY))); } catch { /* ignore */ }
+  try {
+    const res = await fetch("/api/version", { cache: "no-store" });
+    if (!res.ok) return;
+    const v = await res.json();
+    // The server fingerprints the shell assets. A change while we're running means
+    // this page is executing old JS — reload once to pick the new build up. Only
+    // live-fetched stamps count; comparing against localStorage could loop.
+    if (v.stamp) {
+      if (shellStamp && v.stamp !== shellStamp) {
+        location.reload();
+        return;
+      }
+      shellStamp = v.stamp;
+    }
+    localStorage.setItem(VERSION_KEY, JSON.stringify(v));
+    renderAbout(v);
+  } catch { /* offline — whatever we cached stands */ }
 }
 
 function setView(next) {
@@ -227,15 +353,32 @@ function setView(next) {
 for (const b of document.querySelectorAll(".view-btn")) {
   b.addEventListener("click", () => setView(b.dataset.view));
 }
-el.refresh.addEventListener("click", () => load({ manual: true }));
-document.addEventListener("visibilitychange", () => { if (!document.hidden) load(); });
+el.refresh.addEventListener("click", () => load());
+document.addEventListener("visibilitychange", () => {
+  if (document.hidden) return;
+  load();
+  loadVersion(); // a resumed PWA may be running a stale shell — check and self-reload
+});
 
+// Paint the last snapshot before the network is even asked, so a launch is never blank;
+// render() flags it as stale if it's old, and load() replaces it as soon as it lands.
+snapshot = readCached();
 setView(view);
 load();
+loadVersion();
 setInterval(load, REFRESH_MS);
 // Countdowns are derived from resetAt, so re-render locally without refetching.
 ticking = setInterval(() => { if (snapshot) render(); }, 30_000);
 
 if ("serviceWorker" in navigator) {
-  navigator.serviceWorker.register("/sw.js").catch(() => {});
+  // A phone keeps the installed shell until a new SW claims it. Check for one on every
+  // launch, and reload once when it takes over so the page isn't left on the old assets.
+  const hadController = !!navigator.serviceWorker.controller;
+  let reloading = false;
+  navigator.serviceWorker.addEventListener("controllerchange", () => {
+    if (!hadController || reloading) return; // first-ever claim: nothing to replace
+    reloading = true;
+    location.reload();
+  });
+  navigator.serviceWorker.register("/sw.js").then((reg) => reg.update()).catch(() => {});
 }

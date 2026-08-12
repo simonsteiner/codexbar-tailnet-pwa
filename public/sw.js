@@ -2,7 +2,9 @@
 // localStorage snapshot) when the tailnet or the WSL box is unreachable.
 // The snapshot itself is deliberately never cached here — app.js handles staleness.
 
-const CACHE = "codexbar-shell-v1";
+// Bump on shell changes: activate deletes every other cache, which is the only way to
+// evict entries an older SW stored back when assets were served with a long max-age.
+const CACHE = "codexbar-shell-v2";
 const SHELL = [
   "/",
   "/styles.css",
@@ -37,6 +39,8 @@ self.addEventListener("fetch", (event) => {
         caches.open(CACHE).then((c) => c.put(event.request, copy)).catch(() => {});
         return res;
       })
-      .catch(() => caches.match(event.request).then((hit) => hit ?? caches.match("/"))),
+      // ignoreSearch: the page asks for /app.js?v=<mtime>, the shell was cached as /app.js.
+      .catch(() => caches.match(event.request, { ignoreSearch: true })
+        .then((hit) => hit ?? caches.match("/"))),
   );
 });

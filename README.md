@@ -22,6 +22,16 @@ Three views, remembered across launches:
 - **Resets** — every window across every provider, soonest reset first, with large countdowns.
 - **Dense** — one compact row per window.
 
+Every view leads with the *reserve* — the headroom left rather than the amount burnt: `35% left`
+per window (with `65% used` alongside it) and the remaining credit balance for providers that
+report one. Opening the app paints the last snapshot from `localStorage` immediately and refreshes
+behind a spinner, so a launch is never a blank screen.
+
+The footer links back to the repo (taken from your `origin` remote, so forks link to themselves)
+and shows the commit the server is running, linked to that commit on GitHub. It comes from
+`/api/version`, which reads `.git` directly — a checkout with uncommitted edits still reports
+whatever `HEAD` points at.
+
 ## Why a proxy instead of pointing the phone at `codexbar serve`
 
 Three concrete blockers, all handled here:
@@ -95,6 +105,14 @@ Read from `~/.config/codexbar/dashboard.env` (mode 600):
 | `CBT_UPSTREAM_PORT` | `8087` | Where `codexbar serve` listens |
 | `CBT_CACHE_TTL` | `60` | Snapshot cache seconds |
 | `CBT_UPSTREAM_TIMEOUT` | `90` | Upstream deadline; keep above `serve --request-timeout` |
+| `CBT_ACTIVE_WINDOW` | `600` | Keep the cache warm this long after the last client request |
+| `CBT_POLL` | `45` | Background refresh cadence while inside the active window |
+
+Snapshot serving is stale-while-revalidate: a request never waits on a live provider
+fetch when any cached copy exists — it gets the cached body plus `X-Snapshot-Refreshing: true`,
+and the app re-polls until the background refresh lands. `codexbar serve` itself is lazy
+(its `--refresh-interval` is only a cache TTL), so the active-window poller is what keeps
+"open the app, see fresh numbers" fast instead of a ~13 s cold fetch.
 
 `TS_PORT` (default `443`) is read by `install.sh` only, not by the server.
 
@@ -113,6 +131,14 @@ journalctl --user -u codexbar-tailnet -f
 tailscale serve status
 ```
 
+### Picking up updates
+
+`index.html` and `sw.js` are `no-store`; `app.js` and `styles.css` are `no-cache` with an `ETag`,
+so a phone revalidates them on every launch and gets a `304` when nothing changed. `index.html`
+also stamps those two URLs with the file's mtime (`/app.js?v=msf6fpmj`), which means an edited
+asset arrives under a URL no cache has ever seen. Pulling updates needs no restart for the UI;
+restart `codexbar-tailnet` only when `server.mjs` itself changes.
+
 ## Provider notes on Linux
 
 CodexBar reuses existing provider sessions, and some of those paths are macOS-only. On Linux:
@@ -123,6 +149,11 @@ CodexBar reuses existing provider sessions, and some of those paths are macOS-on
   path first and time out. Local cost scans of `~/.claude` work regardless.
 - **Providers whose only source is a browser session** (OpenCode's web source, Cursor cost, and
   automatic cookie import generally) are macOS-only; several accept a manual `Cookie:` header.
+- **OpenCode** ships as two providers. `opencode` has only the web source, so on Linux it fails
+  with *"selected source requires web support and is only supported on macOS"* — `--source cli`
+  and `--source api` are not implemented for it. `opencodego` reads local state instead and works
+  here, reporting 5-hour, weekly and monthly windows. Enable that one:
+  `codexbar config enable --provider opencodego`.
 
 Local cost figures reflect *that machine's* agent runs, so a box that doesn't run your agents
 won't show their spend.

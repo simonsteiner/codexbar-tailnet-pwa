@@ -76,6 +76,9 @@ body {
 
 .content { padding: 0 16px 8px; display: grid; gap: 10px; }
 .meta { padding: 6px 16px 28px; color: var(--muted); font-size: 12px; text-align: center; }
+.about { margin-top: 4px; font-size: 11.5px; }
+.about a { color: var(--muted); text-decoration: none; border-bottom: 1px solid var(--line); }
+.about a:active { color: var(--text); }
 
 /* ---------- shared bits ---------- */
 
@@ -105,8 +108,10 @@ body {
   background: var(--surface-2); border-radius: 999px; padding: 3px 9px;
 }
 .win { display: grid; gap: 5px; }
-.win-top { display: flex; justify-content: space-between; font-size: 12.5px; }
+.win-top { display: flex; justify-content: space-between; gap: 10px; font-size: 12.5px; }
 .win-label { color: var(--muted); }
+.win-top b { font-weight: 640; }
+.win-sub { color: var(--muted); margin-left: 6px; }
 .card-foot {
   display: flex; gap: 14px; flex-wrap: wrap;
   font-size: 12.5px; color: var(--muted);
@@ -124,6 +129,8 @@ body {
 .reset-when { font-size: 25px; font-weight: 640; letter-spacing: -0.02em; grid-row: span 2; }
 .reset-who { display: flex; align-items: center; gap: 7px; font-weight: 600; }
 .reset-sub { color: var(--muted); font-size: 12.5px; }
+.reset-sub b { font-weight: 640; }
+.reset-foot { grid-column: 1 / -1; }
 .reset-bar { grid-column: 1 / -1; margin-top: 6px; }
 
 /* ---------- dense view ---------- */
@@ -137,7 +144,8 @@ body {
 .drow:last-child { border-bottom: 0; }
 .dname { font-weight: 570; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .dwin { color: var(--muted); font-size: 11.5px; }
-.dpct { font-weight: 640; min-width: 42px; text-align: right; }
+.dpct { font-weight: 640; min-width: 62px; text-align: right; }
+.dsuf { color: var(--muted); font-size: 10.5px; font-weight: 500; margin-left: 3px; }
 .dreset { color: var(--muted); font-size: 12px; min-width: 62px; text-align: right; }
 
 .empty { color: var(--muted); text-align: center; padding: 36px 0; }
