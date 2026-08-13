@@ -45,6 +45,10 @@ const severity = (pct) => (pct >= 90 ? "crit" : pct >= 75 ? "warn" : "ok");
 // that meters remaining separately needn't have the two add up to 100.
 const reserve = (w) => Math.max(0, Math.round(w.remainingPercent ?? 100 - w.usedPercent));
 
+// Bars drain rather than fill: the filled part is the reserve, so a full bar means a full tank.
+// Matches the Android client's gauge; the severity color still keys off how much is *used*.
+const barWidth = (w) => Math.min(reserve(w), 100);
+
 /** Remaining credit balance for a provider, or null if it doesn't report one. */
 function creditsLeft(p) {
   if (p.credits?.remaining == null) return null;
@@ -127,7 +131,7 @@ function renderCards(snap) {
               <span class="win-sub">${pct}% used${cd ? ` · ${cd}` : ""}</span>
             </span>
           </div>
-          <div class="bar"><i class="fill-${sev}" style="width:${Math.min(pct, 100)}%"></i></div>
+          <div class="bar"><i class="fill-${sev}" style="width:${barWidth(w)}%"></i></div>
         </div>`;
     }).join("");
 
@@ -186,7 +190,7 @@ function renderResets(snap) {
         <div class="reset-sub mono"><b class="t-${sev}">${reserve(win)}% left</b> · ${pct}% used</div>
         <div class="reset-sub reset-foot mono">resets ${esc(local)}${
           credits ? ` · ${esc(credits.value)} ${esc(credits.unit)} left` : ""}</div>
-        <div class="bar reset-bar"><i class="fill-${sev}" style="width:${Math.min(pct, 100)}%"></i></div>
+        <div class="bar reset-bar"><i class="fill-${sev}" style="width:${barWidth(win)}%"></i></div>
       </section>`;
   }).join("");
 }
