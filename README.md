@@ -131,13 +131,33 @@ journalctl --user -u codexbar-tailnet -f
 tailscale serve status
 ```
 
+### Load path
+
+A launch paints usable data without a single round trip. Three things get it there:
+
+- **One document.** The server inlines `styles.css` and `app.js` into `/` and gzips the result
+  (~26 KB → ~9 KB), so the shell costs one request instead of three. The standalone files stay
+  served for debugging; nothing references them.
+- **The snapshot ships inside the page.** `/` embeds the proxy's warm snapshot as
+  `window.__BOOT__`, so the UI has real numbers before it can even ask for them. A launch skips
+  its opening `/api/snapshot` fetch when that copy is under 10 s old and not mid-refresh.
+  Embedding never blocks: a cold proxy just ships the page without one.
+- **The service worker is cache-first**, not network-first. It answers from cache and revalidates
+  behind the response, so a launch never waits out a round trip — which on a tailnet is ~200 ms
+  each, and was most of the several seconds this used to take.
+
 ### Picking up updates
 
-`index.html` and `sw.js` are `no-store`; `app.js` and `styles.css` are `no-cache` with an `ETag`,
-so a phone revalidates them on every launch and gets a `304` when nothing changed. `index.html`
-also stamps those two URLs with the file's mtime (`/app.js?v=msf6fpmj`), which means an edited
-asset arrives under a URL no cache has ever seen. Pulling updates needs no restart for the UI;
-restart `codexbar-tailnet` only when `server.mjs` itself changes.
+Cache-first means a launch can paint a build-old shell, so two mechanisms replace it. `/` carries
+`X-Shell-Stamp`, the mtimes of `app.js` and `styles.css`; when the worker's revalidation sees that
+header change it messages the page, which reloads into the copy it just stored — normally within a
+few hundred milliseconds of the launch. `/api/version` reports the same stamp, which is how a
+resumed PWA that never re-navigated notices it is running old JS.
+
+`index.html` and `sw.js` are `no-store`; everything else is `no-cache` with an encoding-aware
+`ETag`, so a direct (non-SW) client revalidates and gets a `304` when nothing changed. The
+inlined document is rebuilt whenever those mtimes move, so editing `app.js` or `styles.css` needs
+no restart; restart `codexbar-tailnet` only when `server.mjs` itself changes.
 
 ## Provider notes on Linux
 

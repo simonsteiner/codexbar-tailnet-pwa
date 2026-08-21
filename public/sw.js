@@ -1,17 +1,19 @@
-// Cache the app shell so the PWA opens instantly and still renders (from the
-// localStorage snapshot) when the tailnet or the WSL box is unreachable.
-// The snapshot itself is deliberately never cached here — app.js handles staleness.
+// Cache the app shell so the PWA opens instantly and still renders (from the page's
+// embedded snapshot or localStorage) when the tailnet or the WSL box is unreachable.
+// The snapshot route itself is deliberately never cached here — app.js handles staleness.
 
 // Bump on shell changes: activate deletes every other cache, which is the only way to
 // evict entries an older SW stored back when assets were served with a long max-age.
-const CACHE = "codexbar-shell-v2";
+const CACHE = "codexbar-shell-v3";
+
+// `/` is now a self-contained document — styles.css and app.js are inlined into it by
+// the server — so the shell is one entry plus the icons the launcher needs.
 const SHELL = [
   "/",
-  "/styles.css",
-  "/app.js",
   "/manifest.webmanifest",
   "/icons/icon-192.png",
   "/icons/icon-512.png",
+  "/icons/icon-maskable-512.png",
 ];
 
 self.addEventListener("install", (event) => {
@@ -26,21 +28,49 @@ self.addEventListener("activate", (event) => {
   );
 });
 
+async function notifyShellUpdated() {
+  for (const client of await self.clients.matchAll({ type: "window" })) {
+    client.postMessage({ type: "shell-updated" });
+  }
+}
+
+// Refresh the cached copy behind the response we already returned. The document's body
+// differs on every request (it carries a fresh snapshot), so a byte comparison would
+// cry wolf every launch — X-Shell-Stamp changes only when app.js or styles.css do.
+async function revalidate(request, cached) {
+  try {
+    const res = await fetch(request, { cache: "no-store" });
+    if (!res.ok) return;
+    const before = cached?.headers.get("X-Shell-Stamp");
+    const after = res.headers.get("X-Shell-Stamp");
+    await (await caches.open(CACHE)).put(request, res.clone());
+    if (before && after && before !== after) await notifyShellUpdated();
+  } catch { /* offline — the cached copy stands */ }
+}
+
 self.addEventListener("fetch", (event) => {
   const url = new URL(event.request.url);
   if (event.request.method !== "GET" || url.origin !== self.location.origin) return;
   if (url.pathname.startsWith("/api/")) return; // always hit the network
 
-  // Network-first so shell updates land, cache as the offline floor.
-  event.respondWith(
-    fetch(event.request)
-      .then((res) => {
-        const copy = res.clone();
-        caches.open(CACHE).then((c) => c.put(event.request, copy)).catch(() => {});
-        return res;
-      })
-      // ignoreSearch: the page asks for /app.js?v=<mtime>, the shell was cached as /app.js.
-      .catch(() => caches.match(event.request, { ignoreSearch: true })
-        .then((hit) => hit ?? caches.match("/"))),
-  );
+  // Cache-first, not network-first: this tailnet costs ~200 ms per round trip, and a
+  // launch that waits one out before painting is the whole complaint. The revalidation
+  // behind it is what keeps a stale shell from sticking.
+  event.respondWith((async () => {
+    const cache = await caches.open(CACHE);
+    // ignoreSearch: a launch may arrive as `/?utm=…` or with a start_url query.
+    const cached = await cache.match(event.request, { ignoreSearch: true });
+    if (cached) {
+      try { event.waitUntil(revalidate(event.request, cached)); } catch { /* event closed */ }
+      return cached;
+    }
+    try {
+      const res = await fetch(event.request);
+      if (res.ok) cache.put(event.request, res.clone()).catch(() => {});
+      return res;
+    } catch {
+      // Nothing cached under this URL: the shell is the only useful thing left to show.
+      return (await cache.match("/")) ?? Response.error();
+    }
+  })());
 });

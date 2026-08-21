@@ -12,10 +12,15 @@
 import http from "node:http";
 import fs from "node:fs/promises";
 import path from "node:path";
+import zlib from "node:zlib";
 import { fileURLToPath } from "node:url";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const PUBLIC_DIR = path.join(HERE, "public");
+
+// The two assets whose mtimes make up the shell fingerprint, and which index.html
+// inlines. Keeping the list here means adding an asset updates both at once.
+const STAMPED = ["app.js", "styles.css"];
 
 const PORT = Number(process.env.CBT_PORT ?? 8899);
 const BIND = process.env.CBT_BIND ?? "127.0.0.1";
@@ -53,6 +58,31 @@ const MIME = {
   ".ico": "image/x-icon",
 };
 
+// A phone on a tailnet pays ~200 ms per round trip, so bytes on the wire are worth
+// more than the microseconds gzip costs. Sync compression is fine: every response
+// here is a few KB, and the alternative (a stream) would buy nothing measurable.
+const GZIP_MIN_BYTES = 512;
+const GZIPPABLE = /^(?:text\/|application\/(?:json|manifest\+json|javascript))/;
+
+const acceptsGzip = (req) => /\bgzip\b/.test(req.headers["accept-encoding"] ?? "");
+
+/** True when this response is both worth compressing and welcome to be. */
+const shouldGzip = (req, type, size) =>
+  acceptsGzip(req) && size >= GZIP_MIN_BYTES && GZIPPABLE.test(type);
+
+/** Write a body, gzipping it when `gzip` says so. Honours HEAD. */
+function sendBody(req, res, status, headers, body, gzip) {
+  const buf = Buffer.isBuffer(body) ? body : Buffer.from(body, "utf8");
+  const out = gzip ? zlib.gzipSync(buf) : buf;
+  res.writeHead(status, {
+    ...headers,
+    ...(gzip ? { "Content-Encoding": "gzip" } : {}),
+    Vary: "Accept-Encoding",
+    "Content-Length": out.length,
+  });
+  res.end(req.method === "HEAD" ? undefined : out);
+}
+
 /** @type {{value: {commit: string|null, short: string|null, repo: string}, at: number} | null} */
 let version = null;
 
@@ -84,24 +114,30 @@ async function readRepo() {
   return https.startsWith("https://") ? https : null;
 }
 
-async function getVersion() {
-  if (version && Date.now() - version.at < VERSION_TTL_MS) return version.value;
-  let commit = null;
-  let repo = null;
-  try { commit = await readCommit(); } catch { /* not a checkout */ }
-  try { repo = await readRepo(); } catch { /* no remote */ }
-  // Shell fingerprint: the same mtime stamps index.html embeds in asset URLs.
-  // A resumed PWA compares this to the value it booted with and reloads itself
-  // on change — a backgrounded phone otherwise runs old JS until a manual reload.
-  let stamp = null;
+// Shell fingerprint: the mtimes of the assets index.html inlines. A resumed PWA
+// compares this to the value it booted with and reloads itself on change, and the
+// service worker compares it across a revalidation — a backgrounded phone otherwise
+// runs old JS until a manual reload. Null when an asset is missing.
+async function shellStamp() {
   try {
     const parts = [];
     for (const name of STAMPED) {
       const { mtimeMs } = await fs.stat(path.join(PUBLIC_DIR, name));
       parts.push(Math.floor(mtimeMs).toString(36));
     }
-    stamp = parts.join(".");
-  } catch { /* asset missing — leave unstamped */ }
+    return parts.join(".");
+  } catch {
+    return null;
+  }
+}
+
+async function getVersion() {
+  if (version && Date.now() - version.at < VERSION_TTL_MS) return version.value;
+  let commit = null;
+  let repo = null;
+  try { commit = await readCommit(); } catch { /* not a checkout */ }
+  try { repo = await readRepo(); } catch { /* no remote */ }
+  const stamp = await shellStamp();
   const value = { commit, short: commit?.slice(0, 7) ?? null, repo: repo ?? REPO_FALLBACK, stamp };
   version = { value, at: Date.now() };
   return value;
@@ -179,6 +215,16 @@ async function getSnapshot() {
   return { ...(await pending), cached: false, refreshing: false };
 }
 
+// Same policy as getSnapshot(), minus the waiting: index.html must never block on a
+// live provider fetch, because a page that renders late is worse than one that renders
+// slightly stale data and corrects itself a moment later. Returns null on a truly cold
+// boot, having kicked off the refresh the first client request will pick up.
+function peekSnapshot() {
+  const hit = cache ?? lastGood;
+  if (!hit || Date.now() - hit.at >= CACHE_TTL_MS) refresh().catch(() => {});
+  return hit ? { body: hit.body, at: hit.at, refreshing: !!inFlight } : null;
+}
+
 let lastClientAt = 0;
 
 // While someone is actually looking (a request within ACTIVE_WINDOW_MS), keep the
@@ -193,18 +239,58 @@ setInterval(() => {
 // Prewarm at boot so even the first-ever request finds a cache.
 refresh().catch(() => {});
 
-// index.html is never cached, but the assets it points at may already sit in a phone's
-// HTTP cache under terms we can no longer change. Stamping each URL with the file's mtime
-// makes a changed asset a changed URL, which no stale entry can answer.
-const STAMPED = ["app.js", "styles.css"];
+// Nothing in an inlined document can close the tag that carries it. CSS and JS never
+// legitimately contain these sequences outside a string, where the escape is a no-op.
+const deTag = (s) => s.replace(/<\/(script|style)/gi, "<\\/$1");
+
+/** @type {{stamp: string|null, html: string} | null} */
+let shell = null;
+
+// One document, no sub-resources. The old three-request shell cost the phone two extra
+// round trips before it could paint (~200 ms each on this tailnet) and bought nothing:
+// every asset was served `no-cache`, so a launch revalidated all of them anyway.
+async function buildShell() {
+  const stamp = await shellStamp();
+  if (shell && shell.stamp === stamp) return shell;
+  const [html, css, js] = await Promise.all([
+    fs.readFile(path.join(PUBLIC_DIR, "index.html"), "utf8"),
+    fs.readFile(path.join(PUBLIC_DIR, "styles.css"), "utf8"),
+    fs.readFile(path.join(PUBLIC_DIR, "app.js"), "utf8"),
+  ]);
+  // Function replacers, not strings: `$$`, `$&` and friends are substitution syntax in a
+  // replacement string, and app.js is full of `` `$${n}` `` — which silently ate the
+  // dollar sign off every cost figure until this was a function.
+  shell = {
+    stamp,
+    html: html
+      .replace(/<link rel="stylesheet"[^>]*>/, () => `<style>${deTag(css)}</style>`)
+      .replace(/<script src="\/app\.js"[^>]*><\/script>/, () => `<script type="module">${deTag(js)}</script>`),
+  };
+  return shell;
+}
+
+// The snapshot the proxy already holds, shipped inside the page. Without this the phone
+// cannot even ask for data until the document has arrived and its JS has run — one more
+// round trip on the critical path, for a payload the server had ready all along.
+function bootScript(snap, ver) {
+  const fields = [`"version":${JSON.stringify(ver)}`];
+  if (snap) {
+    fields.push(
+      `"snapshot":${snap.body}`,          // already JSON; re-encoding would double-escape it
+      `"refreshing":${snap.refreshing}`,
+    );
+  }
+  // `<` only ever occurs inside a JSON string here, where < means the same thing.
+  const json = `{${fields.join(",")}}`.replace(/</g, "\\u003c");
+  return `<script>window.__BOOT__=${json}</script>`;
+}
 
 async function readIndex() {
-  let html = await fs.readFile(path.join(PUBLIC_DIR, "index.html"), "utf8");
-  for (const name of STAMPED) {
-    const { mtimeMs } = await fs.stat(path.join(PUBLIC_DIR, name));
-    html = html.replaceAll(`/${name}"`, `/${name}?v=${Math.floor(mtimeMs).toString(36)}"`);
-  }
-  return html;
+  const built = await buildShell();
+  // Classic inline scripts run before deferred module scripts, so __BOOT__ is always
+  // defined by the time app.js looks for it.
+  const script = bootScript(peekSnapshot(), await getVersion());
+  return built.html.replace("</head>", () => `${script}</head>`);
 }
 
 async function serveStatic(req, res, urlPath) {
@@ -219,13 +305,15 @@ async function serveStatic(req, res, urlPath) {
     const stat = await fs.stat(full);
     const type = MIME[path.extname(full).toLowerCase()] ?? "application/octet-stream";
     if (rel === "index.html") {
+      lastClientAt = Date.now(); // opening the app counts as activity, same as polling it
       const html = Buffer.from(await readIndex(), "utf8");
-      res.writeHead(200, {
+      sendBody(req, res, 200, {
         "Content-Type": type,
         "Cache-Control": "no-store",
-        "Content-Length": html.length,
-      });
-      res.end(req.method === "HEAD" ? undefined : html);
+        // The service worker serves this document from cache and revalidates behind it;
+        // this header is how it tells a shell update from a new embedded snapshot.
+        ...(shell?.stamp ? { "X-Shell-Stamp": shell.stamp } : {}),
+      }, html, shouldGzip(req, type, html.length));
       return;
     }
     // The service worker must never be pinned, or an update never lands.
@@ -233,18 +321,20 @@ async function serveStatic(req, res, urlPath) {
     // Everything else is `no-cache`, not `max-age`: the phone may cache it, but has to
     // revalidate every time. Pinning assets for an hour meant an updated app.js kept
     // losing to a stale copy in the browser's HTTP cache, even through a network-first SW.
-    const etag = `W/"${stat.size.toString(16)}-${Math.floor(stat.mtimeMs).toString(16)}"`;
+    const gzip = shouldGzip(req, type, stat.size);
+    // The encoding is part of what the entity tag identifies, or a shared cache could
+    // hand a gzipped body to a client that never asked for one.
+    const etag = `W/"${stat.size.toString(16)}-${Math.floor(stat.mtimeMs).toString(16)}${gzip ? "-gz" : ""}"`;
     const headers = {
       "Content-Type": type,
       "Cache-Control": noStore ? "no-store" : "no-cache",
       ...(noStore ? {} : { ETag: etag, "Last-Modified": stat.mtime.toUTCString() }),
     };
     if (!noStore && req.headers["if-none-match"] === etag) {
-      res.writeHead(304, headers).end();
+      res.writeHead(304, { ...headers, Vary: "Accept-Encoding" }).end();
       return;
     }
-    res.writeHead(200, { ...headers, "Content-Length": stat.size });
-    res.end(req.method === "HEAD" ? undefined : await fs.readFile(full));
+    sendBody(req, res, 200, headers, await fs.readFile(full), gzip);
   } catch {
     res.writeHead(404, { "Content-Type": "text/plain" }).end("not found");
   }
@@ -267,26 +357,25 @@ const server = http.createServer(async (req, res) => {
 
   if (urlPath === "/api/snapshot") {
     lastClientAt = Date.now();
+    const json = "application/json; charset=utf-8";
     try {
       const snap = await getSnapshot();
-      res.writeHead(200, {
-        "Content-Type": "application/json; charset=utf-8",
+      sendBody(req, res, 200, {
+        "Content-Type": json,
         "Cache-Control": "no-store",
         "X-Snapshot-Cached": String(snap.cached),
         "X-Snapshot-Refreshing": String(snap.refreshing),
         "X-Snapshot-Age": String(Math.round((Date.now() - snap.at) / 1000)),
-      });
-      res.end(snap.body);
+      }, snap.body, shouldGzip(req, json, Buffer.byteLength(snap.body)));
     } catch (err) {
       // Fall back to the last good snapshot so a single slow provider doesn't blank the phone.
       if (lastGood) {
-        res.writeHead(200, {
-          "Content-Type": "application/json; charset=utf-8",
+        sendBody(req, res, 200, {
+          "Content-Type": json,
           "Cache-Control": "no-store",
           "X-Snapshot-Stale": "true",
           "X-Snapshot-Error": String(err.message).slice(0, 200),
-        });
-        res.end(lastGood.body);
+        }, lastGood.body, shouldGzip(req, json, Buffer.byteLength(lastGood.body)));
         return;
       }
       res.writeHead(502, { "Content-Type": "application/json", "Cache-Control": "no-store" });

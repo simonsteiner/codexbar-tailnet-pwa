@@ -5,6 +5,14 @@ const REFRESH_MS = 60_000;
 const VIEW_KEY = "codexbar.view";
 const LAST_KEY = "codexbar.last";
 const VERSION_KEY = "codexbar.version";
+// How fresh the snapshot the server embedded in the page must be for the launch to skip
+// its opening fetch. Below this the proxy has demonstrably just checked upstream.
+const BOOT_FRESH_MS = 10_000;
+
+// The server inlines its warm snapshot and version into the document, so a launch has
+// real data before it has made a single request. Absent when the page came from the
+// service worker's cache under an older build, hence the guards everywhere below.
+const boot = globalThis.__BOOT__ ?? null;
 
 const el = {
   content: document.getElementById("content"),
@@ -323,9 +331,13 @@ function renderAbout(v) {
   el.about.innerHTML = repoLink + hashLink;
 }
 
+/** The build label for the footer: this page's own, or the last one we stored. */
+function knownVersion() {
+  if (boot?.version?.repo) return boot.version;
+  try { return JSON.parse(localStorage.getItem(VERSION_KEY)); } catch { return null; }
+}
+
 async function loadVersion() {
-  // Cached so an offline launch still says which build is installed.
-  try { renderAbout(JSON.parse(localStorage.getItem(VERSION_KEY))); } catch { /* ignore */ }
   try {
     const res = await fetch("/api/version", { cache: "no-store" });
     if (!res.ok) return;
@@ -364,12 +376,31 @@ document.addEventListener("visibilitychange", () => {
   loadVersion(); // a resumed PWA may be running a stale shell — check and self-reload
 });
 
-// Paint the last snapshot before the network is even asked, so a launch is never blank;
-// render() flags it as stale if it's old, and load() replaces it as soon as it lands.
-snapshot = readCached();
+/** Whichever of two snapshots was generated later; nulls lose. */
+const newerOf = (a, b) => (generatedMs(a) >= generatedMs(b) ? a : b);
+function generatedMs(s) {
+  const t = s?.generatedAt ? new Date(s.generatedAt).getTime() : NaN;
+  return Number.isNaN(t) ? -Infinity : t;
+}
+
+// Paint before the network is even asked, so a launch is never blank. Two candidates:
+// what the server embedded in this page, and what we last stored. The page usually wins,
+// but a service worker can serve a cached document older than our own last refresh.
+snapshot = newerOf(boot?.snapshot ?? null, readCached());
+if (snapshot) localStorage.setItem(LAST_KEY, JSON.stringify(snapshot));
+renderAbout(knownVersion());
 setView(view);
-load();
-loadVersion();
+
+// Skip the opening fetch when the embedded snapshot is fresh and settled — the proxy
+// checked upstream moments ago, and the interval below takes it from here.
+const bootIsCurrent = snapshot === boot?.snapshot
+  && !boot.refreshing
+  && Date.now() - generatedMs(snapshot) < BOOT_FRESH_MS;
+if (!bootIsCurrent) load();
+
+// Deferred: the shell fingerprint only matters once the page has settled, and at boot
+// this would compete with the snapshot fetch for a narrow link.
+setTimeout(loadVersion, 2000);
 setInterval(load, REFRESH_MS);
 // Countdowns are derived from resetAt, so re-render locally without refetching.
 ticking = setInterval(() => { if (snapshot) render(); }, 30_000);
@@ -379,10 +410,20 @@ if ("serviceWorker" in navigator) {
   // launch, and reload once when it takes over so the page isn't left on the old assets.
   const hadController = !!navigator.serviceWorker.controller;
   let reloading = false;
-  navigator.serviceWorker.addEventListener("controllerchange", () => {
-    if (!hadController || reloading) return; // first-ever claim: nothing to replace
+  const reloadOnce = () => {
+    if (reloading) return;
     reloading = true;
     location.reload();
+  };
+  navigator.serviceWorker.addEventListener("controllerchange", () => {
+    if (!hadController) return; // first-ever claim: nothing to replace
+    reloadOnce();
+  });
+  // The shell is served from cache and revalidated behind us, so this page can be a
+  // build behind the moment it paints. The worker says so once the new one is stored;
+  // reloading then is guaranteed to pick it up rather than re-serving what we have.
+  navigator.serviceWorker.addEventListener("message", (e) => {
+    if (e.data?.type === "shell-updated") reloadOnce();
   });
   navigator.serviceWorker.register("/sw.js").then((reg) => reg.update()).catch(() => {});
 }
