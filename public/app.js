@@ -100,12 +100,17 @@ function plan(p) {
 const esc = (s) => String(s).replace(/[&<>"']/g, (c) =>
   ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
 
+// dashboard-v1 marks a window `idle` when it belongs to a model family the provider
+// reports no usage for (Antigravity emits one row per quota bucket). The key is only
+// ever present when true, and only the producer can tell idle from a genuine 0%.
+const shown = (w) => w.usedPercent != null && w.idle !== true;
+
 /** Every window across every provider, flattened, newest-resetting first. */
 function allWindows(snap) {
   const out = [];
   for (const p of snap.providers ?? []) {
     for (const w of p.windows ?? []) {
-      if (w.usedPercent == null) continue;
+      if (!shown(w)) continue;
       out.push({ provider: p, win: w });
     }
   }
@@ -124,7 +129,7 @@ function renderCards(snap) {
 
   return providers.map((p) => {
     const accent = p.display?.accentColor ?? "#6e5aff";
-    const wins = (p.windows ?? []).filter((w) => w.usedPercent != null);
+    const wins = (p.windows ?? []).filter(shown);
 
     const winHtml = wins.map((w) => {
       const pct = Math.round(w.usedPercent);
@@ -205,7 +210,7 @@ function renderResets(snap) {
 
 function renderDense(snap) {
   const rows = allWindows(snap);
-  const failed = (snap.providers ?? []).filter((p) => p.error && !(p.windows ?? []).length);
+  const failed = (snap.providers ?? []).filter((p) => p.error && !(p.windows ?? []).some(shown));
   const credited = (snap.providers ?? [])
     .map((p) => ({ p, credits: creditsLeft(p) }))
     .filter((x) => x.credits);
