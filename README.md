@@ -9,11 +9,12 @@ and without putting a credential on the device.
 
 ```
 Android/iOS PWA ──https──▶ tailscale serve ──▶ node :8899 (loopback)
-  <host>.<tailnet>.ts.net                        ├─ /             static UI
-                                                 └─ /api/snapshot ──▶ 127.0.0.1:8087
-                                                      + Host: 127.0.0.1
-                                                      + Authorization: Bearer …
-                                                                       codexbar serve
+  <host>.<tailnet>.ts.net                        ├── /             static UI
+                                                 ├── /api/snapshot ──▶ 127.0.0.1:8087
+                                                 │                      + Host: 127.0.0.1
+                                                 │                      + Authorization: Bearer …
+                                                 │                                       codexbar serve
+                                                 └── /api/push/*   Web Push notifications
 ```
 
 Three views, remembered across launches:
@@ -31,6 +32,22 @@ The footer links back to the repo (taken from your `origin` remote, so forks lin
 and shows the commit the server is running, linked to that commit on GitHub. It comes from
 `/api/version`, which reads `.git` directly — a checkout with uncommitted edits still reports
 whatever `HEAD` points at.
+
+## Push notifications on window reset
+
+The PWA supports Web Push notifications when rate limit windows renew (e.g. Claude session resets,
+OpenCode Go windows, weekly resets).
+
+- **Zero dependencies**: Full RFC 8291 (message encryption with `aes128gcm`) and RFC 8292 (VAPID
+  authentication with ES256) implementation using Node stdlib `node:crypto`.
+- **Proactive scheduling**: Even if the PWA is closed on your phone, the proxy computes the soonest
+  upcoming reset time across all windows and schedules a proactive refresh timer when there is at
+  least one active subscriber.
+- **Deduplication**: Notifications fire once per reset cycle, tracking reset boundaries and usage
+  drops to avoid spamming.
+- **Device UI**: Tap the bell icon in the topbar to enable/disable notifications or send a test push.
+- **iOS Note**: On iOS 16.4+, Apple requires Web Push apps to be added to the Home Screen first before
+  requesting notification permissions.
 
 ## Why a proxy instead of pointing the phone at `codexbar serve`
 
@@ -107,6 +124,9 @@ Read from `~/.config/codexbar/dashboard.env` (mode 600):
 | `CBT_UPSTREAM_TIMEOUT` | `90` | Upstream deadline; keep above `serve --request-timeout` |
 | `CBT_ACTIVE_WINDOW` | `600` | Keep the cache warm this long after the last client request |
 | `CBT_POLL` | `45` | Background refresh cadence while inside the active window |
+| `CBT_VAPID_PATH` | `~/.config/codexbar/vapid.json` | Path to generated/stored VAPID keys |
+| `CBT_PUSH_SUBSCRIPTIONS_PATH` | `~/.config/codexbar/push-subscriptions.json` | Path to persistent push subscriptions |
+| `CBT_VAPID_SUBJECT` | `mailto:codexbar@local` | Subject URI in VAPID JWT claims |
 
 Snapshot serving is stale-while-revalidate: a request never waits on a live provider
 fetch when any cached copy exists — it gets the cached body plus `X-Snapshot-Refreshing: true`,
@@ -177,25 +197,3 @@ CodexBar reuses existing provider sessions, and some of those paths are macOS-on
 
 Local cost figures reflect *that machine's* agent runs, so a box that doesn't run your agents
 won't show their spend.
-
-## Behaviour when things are down
-
-- Upstream refresh fails → the proxy serves the last good snapshot with `X-Snapshot-Stale: true`,
-  and the UI says so rather than blanking.
-- Phone offline or host asleep → the service worker serves the cached shell and the UI renders the
-  last snapshot from `localStorage`, with a "snapshot is N minutes old" banner.
-- Host sleeps (a laptop, or a WSL VM that idles out) → data goes stale. Nothing here can fix that;
-  the banner is there so stale numbers are never mistaken for current ones.
-
-## Security notes
-
-- The token never reaches the phone and never appears in `ps` (it's passed via `EnvironmentFile`).
-- `codexbar serve` stays bound to loopback and is not reachable from the tailnet; only the proxy is.
-- `tailscale serve` (not `funnel`) means tailnet-only. Don't swap in `funnel` unless you intend to
-  publish your usage data to the internet.
-- Static file serving is contained to `public/`; the snapshot route is never cached by the SW.
-
-## License
-
-MIT — see [LICENSE](LICENSE). Builds on [CodexBar](https://github.com/steipete/CodexBar)
-by Peter Steinberger, also MIT.

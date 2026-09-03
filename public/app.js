@@ -20,6 +20,13 @@ const el = {
   meta: document.getElementById("meta"),
   about: document.getElementById("about"),
   refresh: document.getElementById("refresh"),
+  notifyBtn: document.getElementById("notify"),
+  notifyDot: document.getElementById("notify-dot"),
+  notifyDialog: document.getElementById("notify-dialog"),
+  notifyClose: document.getElementById("notify-close"),
+  notifyToggle: document.getElementById("notify-toggle"),
+  notifyTest: document.getElementById("notify-test"),
+  notifyInfo: document.getElementById("notify-info"),
 };
 
 let snapshot = null;
@@ -32,7 +39,7 @@ let shellStamp = null;
 
 // Spin for the whole refresh cycle, not just the fetch: a warm proxy answers in
 // ~2 ms, so tying the spinner to the request alone makes it an invisible flash.
-const syncSpinner = () => el.refresh.classList.toggle("spinning", loading || updating);
+const syncSpinner = () => el.refresh?.classList.toggle("spinning", loading || updating);
 
 // The proxy answers stale hits instantly and refreshes in the background
 // (X-Snapshot-Refreshing). Re-poll on a short fuse until the fresh data lands.
@@ -58,235 +65,181 @@ const reserve = (w) => Math.max(0, Math.round(w.remainingPercent ?? 100 - w.used
 const barWidth = (w) => Math.min(reserve(w), 100);
 
 /** Remaining credit balance for a provider, or null if it doesn't report one. */
-function creditsLeft(p) {
-  if (p.credits?.remaining == null) return null;
-  const n = Number(p.credits.remaining);
-  return {
-    value: Number.isFinite(n) ? n.toLocaleString() : String(p.credits.remaining),
-    unit: p.credits.unit ?? "credits",
-  };
+const credits = (p) => (typeof p.credits?.remainingUSD === "number" ? p.credits.remainingUSD : null);
+
+function esc(s) {
+  return String(s ?? "")
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
 }
+
+function pdot(p) {
+  const c = p.display?.accentColor ?? "#8b8b96";
+  return `<span class="pdot" style="background:${esc(c)}"></span>`;
+}
+
+function show(msg, isError) {
+  el.status.textContent = msg;
+  el.status.className = isError ? "status error" : "status";
+  el.status.hidden = false;
+}
+function hide() { el.status.hidden = true; }
+
+function readCached() {
+  try { return JSON.parse(localStorage.getItem(LAST_KEY)); } catch { return null; }
+}
+
+/* ---------------- windows & countdowns ---------------- */
+
+// Drop windows the user configured the upstream menu bar to hide.
+const shown = (p) => (p.windows ?? []).filter((w) => !w.idle);
 
 function countdown(iso) {
   if (!iso) return null;
   const ms = new Date(iso).getTime() - Date.now();
-  if (Number.isNaN(ms)) return null;
   if (ms <= 0) return "now";
-  const m = Math.floor(ms / 60000);
-  const d = Math.floor(m / 1440);
-  const h = Math.floor((m % 1440) / 60);
-  const mm = m % 60;
-  if (d > 0) return `${d}d ${h}h`;
-  if (h > 0) return `${h}h ${mm}m`;
-  return `${mm}m`;
+  const m = Math.floor(ms / 60_000);
+  const h = Math.floor(m / 60);
+  const d = Math.floor(h / 24);
+  if (d > 0) return `${d}d ${h % 24}h`;
+  if (h > 0) return `${h}h ${m % 60}m`;
+  return `${Math.max(1, m)}m`;
 }
 
-function money(v) {
-  if (v == null) return null;
-  return v >= 100 ? `$${v.toFixed(0)}` : `$${v.toFixed(2)}`;
-}
-
-// dashboard-v1 redacts the local part but keeps the domain; show only the domain.
-function plan(p) {
-  const bits = [];
-  if (p.identity?.plan) bits.push(p.identity.plan);
-  if (p.identity?.accountEmail) {
-    const at = p.identity.accountEmail.split("@")[1];
-    if (at) bits.push(at);
-  }
-  return bits.join(" · ");
-}
-
-const esc = (s) => String(s).replace(/[&<>"']/g, (c) =>
-  ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
-
-// dashboard-v1 marks a window `idle` when it belongs to a model family the provider
-// reports no usage for (Antigravity emits one row per quota bucket). The key is only
-// ever present when true, and only the producer can tell idle from a genuine 0%.
-const shown = (w) => w.usedPercent != null && w.idle !== true;
-
-/** Every window across every provider, flattened, newest-resetting first. */
+/** Flatten all shown windows across enabled providers for the Resets view. */
 function allWindows(snap) {
-  const out = [];
-  for (const p of snap.providers ?? []) {
-    for (const w of p.windows ?? []) {
-      if (!shown(w)) continue;
-      out.push({ provider: p, win: w });
+  const rows = [];
+  for (const p of snap?.providers ?? []) {
+    if (!p.enabled) continue;
+    for (const win of shown(p)) rows.push({ p, acc: null, win });
+    for (const acc of p.accounts ?? []) {
+      if (acc.active === false) continue;
+      for (const win of shown(acc)) rows.push({ p, acc, win });
     }
   }
-  return out.sort((a, b) => {
-    const ta = a.win.resetAt ? new Date(a.win.resetAt).getTime() : Infinity;
-    const tb = b.win.resetAt ? new Date(b.win.resetAt).getTime() : Infinity;
-    return ta - tb;
-  });
+  return rows;
 }
 
-/* ---------------- views ---------------- */
+/* ---------------- view: cards ---------------- */
 
 function renderCards(snap) {
-  const providers = snap.providers ?? [];
-  if (!providers.length) return `<p class="empty">No providers enabled.</p>`;
-
+  const providers = (snap?.providers ?? []).filter((p) => p.enabled);
+  if (providers.length === 0) {
+    return `<p class="empty">No providers enabled in CodexBar.</p>`;
+  }
   return providers.map((p) => {
-    const accent = p.display?.accentColor ?? "#6e5aff";
-    const wins = (p.windows ?? []).filter(shown);
-
-    const winHtml = wins.map((w) => {
-      const pct = Math.round(w.usedPercent);
-      const sev = severity(pct);
-      const cd = countdown(w.resetAt);
-      return `
-        <div class="win">
-          <div class="win-top">
-            <span class="win-label">${esc(w.label ?? w.kind ?? "Window")}</span>
-            <span class="mono">
-              <b class="t-${sev}">${reserve(w)}% left</b>
-              <span class="win-sub">${pct}% used${cd ? ` · ${cd}` : ""}</span>
-            </span>
-          </div>
-          <div class="bar"><i class="fill-${sev}" style="width:${barWidth(w)}%"></i></div>
-        </div>`;
-    }).join("");
-
-    const foot = [];
-    const credits = creditsLeft(p);
-    if (credits) {
-      foot.push(`<span><b>${esc(credits.value)}</b> ${esc(credits.unit)} left</span>`);
-    }
-    if (p.cost?.todayUSD != null) foot.push(`<span>today <b>${money(p.cost.todayUSD)}</b></span>`);
-    if (p.cost?.last30DaysUSD != null) foot.push(`<span>30d <b>${money(p.cost.last30DaysUSD)}</b></span>`);
-
-    const badge = plan(p);
+    const cred = credits(p);
+    const wins = shown(p);
     return `
       <section class="card">
-        <div class="card-head">
-          <span class="pdot" style="background:${esc(accent)}"></span>
-          <span class="card-name">${esc(p.name ?? p.id)}</span>
-          ${badge ? `<span class="badge">${esc(badge)}</span>` : ""}
-        </div>
-        ${winHtml || (p.error ? "" : `<div class="win-label">No usage window reported.</div>`)}
-        ${p.error ? `<div class="err">${esc(p.error.message ?? "failed")}</div>` : ""}
-        ${foot.length ? `<div class="card-foot">${foot.join("")}</div>` : ""}
-      </section>`;
+        <header class="card-head">
+          ${pdot(p)}
+          <span class="card-name">${esc(p.name)}</span>
+          ${p.identity?.plan ? `<span class="badge">${esc(p.identity.plan)}</span>` : ""}
+        </header>
+
+        ${p.error ? `<div class="err">${esc(p.error)}</div>` : ""}
+
+        ${wins.map((w) => {
+          const res = reserve(w);
+          const sev = severity(w.usedPercent);
+          const cd = countdown(w.resetAt);
+          return `
+            <div class="win">
+              <div class="win-top">
+                <span class="win-label">${esc(w.label ?? w.kind)}</span>
+                <span class="mono">
+                  <b class="t-${sev}">${res}%</b>
+                  ${cd ? `<span class="win-sub">in ${esc(cd)}</span>` : ""}
+                </span>
+              </div>
+              <div class="bar">
+                <i class="fill-${sev}" style="width:${barWidth(w)}%"></i>
+              </div>
+            </div>
+          `;
+        }).join("")}
+
+        ${(p.cost?.todayUSD != null || p.cost?.last30DaysUSD != null || cred != null) ? `
+          <footer class="card-foot">
+            ${p.cost?.todayUSD != null ? `<span>Today <b>$${p.cost.todayUSD.toFixed(2)}</b></span>` : ""}
+            ${p.cost?.last30DaysUSD != null ? `<span>30d <b>$${p.cost.last30DaysUSD.toFixed(2)}</b></span>` : ""}
+            ${cred != null ? `<span>Credit <b>$${cred.toFixed(2)}</b></span>` : ""}
+          </footer>
+        ` : ""}
+      </section>
+    `;
   }).join("");
 }
+
+/* ---------------- view: resets ---------------- */
 
 function renderResets(snap) {
-  const rows = allWindows(snap).filter((r) => r.win.resetAt);
-  if (!rows.length) return `<p class="empty">No reset windows reported.</p>`;
+  const rows = allWindows(snap)
+    .filter((r) => r.win.resetAt)
+    .sort((a, b) => new Date(a.win.resetAt) - new Date(b.win.resetAt));
 
-  // Credits are per provider, not per window; show them once, on its soonest-resetting row.
-  const creditsShown = new Set();
+  if (rows.length === 0) {
+    return `<p class="empty">No upcoming reset windows.</p>`;
+  }
 
-  return rows.map(({ provider, win }) => {
-    const pct = Math.round(win.usedPercent);
-    const sev = severity(pct);
-    const accent = provider.display?.accentColor ?? "#6e5aff";
-    const when = new Date(win.resetAt);
-    const local = when.toLocaleString([], { weekday: "short", hour: "2-digit", minute: "2-digit" });
-
-    const key = provider.id ?? provider.name;
-    let credits = null;
-    if (!creditsShown.has(key)) {
-      credits = creditsLeft(provider);
-      if (credits) creditsShown.add(key);
-    }
-
+  return rows.map(({ p, acc, win }) => {
+    const res = reserve(win);
+    const sev = severity(win.usedPercent);
+    const who = acc ? `${esc(p.name)} <span class="reset-sub">(${esc(acc.label ?? acc.id)})</span>` : esc(p.name);
     return `
       <section class="reset-row">
-        <div class="reset-who">
-          <span class="pdot" style="background:${esc(accent)}"></span>
-          ${esc(provider.name ?? provider.id)}
-          <span class="reset-sub">· ${esc(win.label ?? win.kind ?? "")}</span>
+        <span class="reset-when mono">${esc(countdown(win.resetAt))}</span>
+        <div class="reset-who">${pdot(p)} <span>${who}</span></div>
+        <div class="reset-sub">${esc(win.label ?? win.kind)} \u00b7 <b class="t-${sev} mono">${res}%</b></div>
+        <div class="bar reset-bar">
+          <i class="fill-${sev}" style="width:${barWidth(win)}%"></i>
         </div>
-        <div class="reset-when mono t-${sev}">${countdown(win.resetAt) ?? "—"}</div>
-        <div class="reset-sub mono"><b class="t-${sev}">${reserve(win)}% left</b> · ${pct}% used</div>
-        <div class="reset-sub reset-foot mono">resets ${esc(local)}${
-          credits ? ` · ${esc(credits.value)} ${esc(credits.unit)} left` : ""}</div>
-        <div class="bar reset-bar"><i class="fill-${sev}" style="width:${barWidth(win)}%"></i></div>
-      </section>`;
+      </section>
+    `;
   }).join("");
 }
+
+/* ---------------- view: dense ---------------- */
 
 function renderDense(snap) {
   const rows = allWindows(snap);
-  const failed = (snap.providers ?? []).filter((p) => p.error && !(p.windows ?? []).some(shown));
-  const credited = (snap.providers ?? [])
-    .map((p) => ({ p, credits: creditsLeft(p) }))
-    .filter((x) => x.credits);
-  if (!rows.length && !failed.length && !credited.length) return `<p class="empty">Nothing to show.</p>`;
+  if (rows.length === 0) return `<p class="empty">No active windows.</p>`;
 
-  const body = rows.map(({ provider, win }) => {
-    const pct = Math.round(win.usedPercent);
-    const sev = severity(pct);
-    const accent = provider.display?.accentColor ?? "#6e5aff";
-    return `
-      <div class="drow">
-        <span class="pdot" style="background:${esc(accent)}"></span>
-        <span class="dname">${esc(provider.name ?? provider.id)}
-          <span class="dwin">${esc(win.label ?? win.kind ?? "")} · ${pct}% used</span></span>
-        <span class="dpct mono t-${sev}">${reserve(win)}%<span class="dsuf">left</span></span>
-        <span class="dreset mono">${countdown(win.resetAt) ?? "—"}</span>
-      </div>`;
-  }).join("");
-
-  // Credit balances don't belong to any one window, so they get their own rows.
-  const creds = credited.map(({ p, credits }) => `
-      <div class="drow">
-        <span class="pdot" style="background:${esc(p.display?.accentColor ?? "#6e5aff")}"></span>
-        <span class="dname">${esc(p.name ?? p.id)}
-          <span class="dwin">${esc(credits.unit)}</span></span>
-        <span class="dpct mono">${esc(credits.value)}<span class="dsuf">left</span></span>
-        <span class="dreset mono"></span>
-      </div>`).join("");
-
-  const errs = failed.map((p) => `
-      <div class="drow">
-        <span class="pdot" style="background:${esc(p.display?.accentColor ?? "#6e5aff")}"></span>
-        <span class="dname">${esc(p.name ?? p.id)}</span>
-        <span class="dpct t-crit" style="grid-column: 3 / -1; text-align:right; font-size:12px;">failed</span>
-      </div>`).join("");
-
-  return `<div class="dense">${body}${creds}${errs}</div>`;
+  return `
+    <section class="dense">
+      ${rows.map(({ p, acc, win }) => {
+        const res = reserve(win);
+        const sev = severity(win.usedPercent);
+        const cd = countdown(win.resetAt);
+        const name = acc ? `${p.name} (${acc.label ?? acc.id})` : p.name;
+        return `
+          <div class="drow">
+            ${pdot(p)}
+            <span class="dname">${esc(name)} <span class="dwin">\u00b7 ${esc(win.label ?? win.kind)}</span></span>
+            <span class="dpct mono t-${sev}">${res}<span class="dsuf">%</span></span>
+            <span class="dreset mono">${cd ? esc(cd) : "\u2014"}</span>
+          </div>
+        `;
+      }).join("")}
+    </section>
+  `;
 }
 
-/* ---------------- shell ---------------- */
+/* ---------------- core rendering ---------------- */
 
 function render() {
   if (!snapshot) return;
-  const fn = view === "resets" ? renderResets : view === "dense" ? renderDense : renderCards;
-  el.content.innerHTML = fn(snapshot);
+  if (view === "cards") el.content.innerHTML = renderCards(snapshot);
+  else if (view === "resets") el.content.innerHTML = renderResets(snapshot);
+  else if (view === "dense") el.content.innerHTML = renderDense(snapshot);
 
-  const gen = snapshot.generatedAt ? new Date(snapshot.generatedAt) : null;
-  const staleAfter = (snapshot.staleAfterSeconds ?? 180) * 1000;
-  const age = gen ? Date.now() - gen.getTime() : 0;
-  el.meta.textContent = gen
-    ? `updated ${gen.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}` +
-      (snapshot.host?.codexBarVersion ? ` · CodexBar ${snapshot.host.codexBarVersion}` : "") +
-      (updating ? " · updating…" : "")
-    : updating ? "updating…" : "";
-
-  if (gen && age > staleAfter) {
-    show(`Snapshot is ${Math.round(age / 60000)}m old — is the WSL box awake?`, false);
-  }
-}
-
-function show(msg, isError) {
-  el.status.hidden = false;
-  el.status.textContent = msg;
-  el.status.classList.toggle("error", !!isError);
-}
-const hide = () => { el.status.hidden = true; };
-
-/** Last snapshot we rendered, or null if there isn't one or it didn't survive. */
-function readCached() {
-  const raw = localStorage.getItem(LAST_KEY);
-  if (!raw) return null;
-  try {
-    return JSON.parse(raw);
-  } catch {
-    localStorage.removeItem(LAST_KEY);
-    return null;
+  if (snapshot.generatedAt) {
+    const when = new Date(snapshot.generatedAt).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+    el.meta.textContent = `Updated ${when}`;
   }
 }
 
@@ -295,8 +248,7 @@ async function load() {
   loading = true;
   syncSpinner();
   el.content.setAttribute("aria-busy", "true");
-  // Cold start with nothing cached: say so rather than showing an empty page.
-  if (!snapshot) el.content.innerHTML = `<p class="empty">Loading…</p>`;
+
   try {
     const res = await fetch("/api/snapshot", { cache: "no-store" });
     if (!res.ok) throw new Error(`snapshot ${res.status}`);
@@ -347,9 +299,6 @@ async function loadVersion() {
     const res = await fetch("/api/version", { cache: "no-store" });
     if (!res.ok) return;
     const v = await res.json();
-    // The server fingerprints the shell assets. A change while we're running means
-    // this page is executing old JS — reload once to pick the new build up. Only
-    // live-fetched stamps count; comparing against localStorage could loop.
     if (v.stamp) {
       if (shellStamp && v.stamp !== shellStamp) {
         location.reload();
@@ -374,12 +323,174 @@ function setView(next) {
 for (const b of document.querySelectorAll(".view-btn")) {
   b.addEventListener("click", () => setView(b.dataset.view));
 }
-el.refresh.addEventListener("click", () => load());
+el.refresh?.addEventListener("click", () => load());
 document.addEventListener("visibilitychange", () => {
   if (document.hidden) return;
   load();
-  loadVersion(); // a resumed PWA may be running a stale shell — check and self-reload
+  loadVersion();
 });
+
+/* ---------------- push notifications ---------------- */
+
+function urlBase64ToUint8Array(base64String) {
+  const padding = "=".repeat((4 - (base64String.length % 4)) % 4);
+  const base64 = (base64String + padding).replace(/-/g, "+").replace(/_/g, "/");
+  const rawData = atob(base64);
+  const outputArray = new Uint8Array(rawData.length);
+  for (let i = 0; i < rawData.length; ++i) {
+    outputArray[i] = rawData.charCodeAt(i);
+  }
+  return outputArray;
+}
+
+let pushSub = null;
+let vapidPublicKey = boot?.vapidPublicKey ?? null;
+
+async function getVapidPublicKey() {
+  if (vapidPublicKey) return vapidPublicKey;
+  try {
+    const res = await fetch("/api/push/vapid-public-key", { cache: "no-store" });
+    if (res.ok) {
+      const data = await res.json();
+      vapidPublicKey = data.publicKey;
+    }
+  } catch {}
+  return vapidPublicKey;
+}
+
+async function syncPushState() {
+  if (!("serviceWorker" in navigator) || !("Notification" in window) || !("PushManager" in window)) {
+    el.notifyBtn?.classList.add("disabled");
+    if (el.notifyInfo) {
+      el.notifyInfo.textContent = "Push notifications are not supported in this browser. (On iOS, add CodexBar to your Home Screen first).";
+    }
+    if (el.notifyToggle) {
+      el.notifyToggle.disabled = true;
+      el.notifyToggle.textContent = "Not Supported";
+    }
+    return;
+  }
+
+  try {
+    const reg = await navigator.serviceWorker.ready;
+    pushSub = await reg.pushManager.getSubscription();
+  } catch {
+    pushSub = null;
+  }
+
+  const isSubscribed = !!pushSub;
+  if (el.notifyDot) el.notifyDot.hidden = !isSubscribed;
+  el.notifyBtn?.classList.toggle("active", isSubscribed);
+
+  if (!el.notifyInfo || !el.notifyToggle) return;
+
+  if (Notification.permission === "denied") {
+    el.notifyInfo.textContent = "Notifications are blocked. Please enable notifications in your browser or device settings.";
+    el.notifyToggle.disabled = true;
+    el.notifyToggle.textContent = "Notifications Blocked";
+    el.notifyToggle.className = "btn btn-secondary";
+    if (el.notifyTest) el.notifyTest.hidden = true;
+  } else if (isSubscribed) {
+    el.notifyInfo.innerHTML = "Push notifications are <b>active</b> on this device. You will be alerted whenever a rate limit window renews.";
+    el.notifyToggle.disabled = false;
+    el.notifyToggle.textContent = "Disable Notifications";
+    el.notifyToggle.className = "btn btn-danger";
+    if (el.notifyTest) el.notifyTest.hidden = false;
+  } else {
+    el.notifyInfo.textContent = "Push notifications are disabled on this device.";
+    el.notifyToggle.disabled = false;
+    el.notifyToggle.textContent = "Enable Notifications";
+    el.notifyToggle.className = "btn btn-primary";
+    if (el.notifyTest) el.notifyTest.hidden = true;
+  }
+}
+
+async function togglePush() {
+  if (pushSub) {
+    el.notifyToggle.disabled = true;
+    el.notifyToggle.textContent = "Disabling…";
+    try {
+      await fetch("/api/push/unsubscribe", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ endpoint: pushSub.endpoint }),
+      });
+      await pushSub.unsubscribe();
+      pushSub = null;
+    } catch (err) {
+      alert(`Failed to unsubscribe: ${err.message}`);
+    } finally {
+      await syncPushState();
+    }
+  } else {
+    el.notifyToggle.disabled = true;
+    el.notifyToggle.textContent = "Enabling…";
+    try {
+      const permission = await Notification.requestPermission();
+      if (permission !== "granted") {
+        await syncPushState();
+        return;
+      }
+      const key = await getVapidPublicKey();
+      if (!key) throw new Error("Could not retrieve VAPID public key from server");
+      const reg = await navigator.serviceWorker.ready;
+      pushSub = await reg.pushManager.subscribe({
+        userVisibleOnly: true,
+        applicationServerKey: urlBase64ToUint8Array(key),
+      });
+      await fetch("/api/push/subscribe", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(pushSub),
+      });
+    } catch (err) {
+      alert(`Could not enable notifications: ${err.message}`);
+    } finally {
+      await syncPushState();
+    }
+  }
+}
+
+async function sendTestNotification() {
+  if (!pushSub || !el.notifyTest) return;
+  el.notifyTest.disabled = true;
+  el.notifyTest.textContent = "Sending test…";
+  try {
+    const res = await fetch("/api/push/test", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ endpoint: pushSub.endpoint, keys: pushSub.toJSON().keys }),
+    });
+    if (!res.ok) {
+      const data = await res.json().catch(() => ({}));
+      throw new Error(data.error || `HTTP ${res.status}`);
+    }
+    el.notifyTest.textContent = "Test sent!";
+    setTimeout(() => {
+      if (el.notifyTest) {
+        el.notifyTest.textContent = "Send Test Notification";
+        el.notifyTest.disabled = false;
+      }
+    }, 2500);
+  } catch (err) {
+    alert(`Test push failed: ${err.message}`);
+    el.notifyTest.textContent = "Send Test Notification";
+    el.notifyTest.disabled = false;
+  }
+}
+
+el.notifyBtn?.addEventListener("click", () => {
+  syncPushState();
+  el.notifyDialog?.showModal();
+});
+el.notifyClose?.addEventListener("click", () => el.notifyDialog?.close());
+el.notifyDialog?.addEventListener("click", (e) => {
+  if (e.target === el.notifyDialog) el.notifyDialog.close();
+});
+el.notifyToggle?.addEventListener("click", togglePush);
+el.notifyTest?.addEventListener("click", sendTestNotification);
+
+/* ---------------- startup ---------------- */
 
 /** Whichever of two snapshots was generated later; nulls lose. */
 const newerOf = (a, b) => (generatedMs(a) >= generatedMs(b) ? a : b);
@@ -388,31 +499,21 @@ function generatedMs(s) {
   return Number.isNaN(t) ? -Infinity : t;
 }
 
-// Paint before the network is even asked, so a launch is never blank. Two candidates:
-// what the server embedded in this page, and what we last stored. The page usually wins,
-// but a service worker can serve a cached document older than our own last refresh.
 snapshot = newerOf(boot?.snapshot ?? null, readCached());
 if (snapshot) localStorage.setItem(LAST_KEY, JSON.stringify(snapshot));
 renderAbout(knownVersion());
 setView(view);
 
-// Skip the opening fetch when the embedded snapshot is fresh and settled — the proxy
-// checked upstream moments ago, and the interval below takes it from here.
 const bootIsCurrent = snapshot === boot?.snapshot
   && !boot.refreshing
   && Date.now() - generatedMs(snapshot) < BOOT_FRESH_MS;
 if (!bootIsCurrent) load();
 
-// Deferred: the shell fingerprint only matters once the page has settled, and at boot
-// this would compete with the snapshot fetch for a narrow link.
 setTimeout(loadVersion, 2000);
 setInterval(load, REFRESH_MS);
-// Countdowns are derived from resetAt, so re-render locally without refetching.
 ticking = setInterval(() => { if (snapshot) render(); }, 30_000);
 
 if ("serviceWorker" in navigator) {
-  // A phone keeps the installed shell until a new SW claims it. Check for one on every
-  // launch, and reload once when it takes over so the page isn't left on the old assets.
   const hadController = !!navigator.serviceWorker.controller;
   let reloading = false;
   const reloadOnce = () => {
@@ -421,14 +522,16 @@ if ("serviceWorker" in navigator) {
     location.reload();
   };
   navigator.serviceWorker.addEventListener("controllerchange", () => {
-    if (!hadController) return; // first-ever claim: nothing to replace
+    if (!hadController) return;
     reloadOnce();
   });
-  // The shell is served from cache and revalidated behind us, so this page can be a
-  // build behind the moment it paints. The worker says so once the new one is stored;
-  // reloading then is guaranteed to pick it up rather than re-serving what we have.
   navigator.serviceWorker.addEventListener("message", (e) => {
     if (e.data?.type === "shell-updated") reloadOnce();
   });
-  navigator.serviceWorker.register("/sw.js").then((reg) => reg.update()).catch(() => {});
+  navigator.serviceWorker.register("/sw.js")
+    .then((reg) => {
+      reg.update();
+      syncPushState();
+    })
+    .catch(() => {});
 }

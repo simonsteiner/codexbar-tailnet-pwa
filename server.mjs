@@ -13,7 +13,15 @@ import http from "node:http";
 import fs from "node:fs/promises";
 import path from "node:path";
 import zlib from "node:zlib";
+import os from "node:os";
 import { fileURLToPath } from "node:url";
+import {
+  getVapidKeys,
+  sendPushNotification,
+  SubscriptionStore,
+  extractWindows,
+  detectWindowRenewals,
+} from "./push.mjs";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const PUBLIC_DIR = path.join(HERE, "public");
@@ -36,9 +44,97 @@ const UPSTREAM_TIMEOUT_MS = Number(process.env.CBT_UPSTREAM_TIMEOUT ?? 90) * 100
 const ACTIVE_WINDOW_MS = Number(process.env.CBT_ACTIVE_WINDOW ?? 600) * 1000;
 const POLL_MS = Number(process.env.CBT_POLL ?? 45) * 1000;
 
+const CONFIG_DIR = process.env.CBT_CONFIG_DIR ??
+  (process.env.XDG_CONFIG_HOME
+    ? path.join(process.env.XDG_CONFIG_HOME, "codexbar")
+    : path.join(os.homedir(), ".config", "codexbar"));
+const VAPID_PATH = process.env.CBT_VAPID_PATH ?? path.join(CONFIG_DIR, "vapid.json");
+const SUBSCRIPTIONS_PATH = process.env.CBT_PUSH_SUBSCRIPTIONS_PATH ?? path.join(CONFIG_DIR, "push-subscriptions.json");
+const VAPID_SUBJECT = process.env.CBT_VAPID_SUBJECT ?? "mailto:codexbar@local";
+
 if (!TOKEN) {
   console.error("CODEXBAR_DASHBOARD_TOKEN is not set — the snapshot route would 401. Refusing to start.");
   process.exit(1);
+}
+
+// Push subscription store & VAPID keys
+let vapidKeys = null;
+const subscriptionStore = new SubscriptionStore(SUBSCRIPTIONS_PATH);
+await subscriptionStore.load();
+try {
+  vapidKeys = await getVapidKeys(VAPID_PATH);
+} catch (err) {
+  console.warn("Could not load/generate VAPID keys:", err.message);
+}
+
+// Window renewal detection state
+const windowStates = new Map();
+let resetTimer = null;
+
+function scheduleNextResetCheck(windows) {
+  if (resetTimer) {
+    clearTimeout(resetTimer);
+    resetTimer = null;
+  }
+  if (subscriptionStore.count() === 0) return;
+
+  const now = Date.now();
+  let soonestResetMs = Infinity;
+  for (const win of windows) {
+    if (!win.resetAt) continue;
+    const t = new Date(win.resetAt).getTime();
+    if (t > now && t < soonestResetMs) {
+      soonestResetMs = t;
+    }
+  }
+
+  if (Number.isFinite(soonestResetMs)) {
+    const delay = Math.max(1000, soonestResetMs - now + 3000);
+    const safeDelay = Math.min(delay, 2147483647);
+    resetTimer = setTimeout(() => {
+      resetTimer = null;
+      refresh().catch(() => {});
+    }, safeDelay);
+    resetTimer.unref?.();
+  }
+}
+
+async function handleSnapshotRenewals(snap) {
+  const windows = extractWindows(snap);
+  const renewals = detectWindowRenewals(windows, windowStates);
+
+  if (renewals.length > 0 && subscriptionStore.count() > 0 && vapidKeys) {
+    for (const { win } of renewals) {
+      const title = `${win.providerName} · ${win.label} renewed`;
+      const leftText = win.remainingPercent != null ? ` (${Math.round(win.remainingPercent)}% left)` : "";
+      const accountPrefix = win.accountLabel ? `${win.accountLabel}: ` : "";
+      const body = `${accountPrefix}${win.label} window has been renewed${leftText}.`;
+
+      const payload = {
+        title,
+        body,
+        tag: `renewal-${win.key}`,
+        icon: "/icons/icon-192.png",
+        badge: "/icons/icon-192.png",
+        data: {
+          url: "/",
+          providerId: win.providerId,
+          windowKey: win.key,
+          renewedAt: new Date().toISOString(),
+        },
+      };
+
+      for (const sub of subscriptionStore.all()) {
+        sendPushNotification(sub, payload, vapidKeys, VAPID_SUBJECT).then((res) => {
+          if (res.expired) {
+            subscriptionStore.remove(sub.endpoint);
+          }
+        }).catch(() => {});
+      }
+    }
+  }
+
+  scheduleNextResetCheck(windows);
 }
 
 // Shown in the UI footer. Read straight out of .git rather than shelling out to git,
@@ -192,6 +288,10 @@ function refresh() {
       .then((fresh) => {
         cache = fresh;
         lastGood = fresh;
+        try {
+          const parsed = JSON.parse(fresh.body);
+          handleSnapshotRenewals(parsed).catch(() => {});
+        } catch { /* json parse error */ }
         return fresh;
       })
       .finally(() => {
@@ -272,8 +372,11 @@ async function buildShell() {
 // The snapshot the proxy already holds, shipped inside the page. Without this the phone
 // cannot even ask for data until the document has arrived and its JS has run — one more
 // round trip on the critical path, for a payload the server had ready all along.
-function bootScript(snap, ver) {
-  const fields = [`"version":${JSON.stringify(ver)}`];
+function bootScript(snap, ver, vapidPub) {
+  const fields = [
+    `"version":${JSON.stringify(ver)}`,
+    `"vapidPublicKey":${JSON.stringify(vapidPub ?? null)}`,
+  ];
   if (snap) {
     fields.push(
       `"snapshot":${snap.body}`,          // already JSON; re-encoding would double-escape it
@@ -289,8 +392,32 @@ async function readIndex() {
   const built = await buildShell();
   // Classic inline scripts run before deferred module scripts, so __BOOT__ is always
   // defined by the time app.js looks for it.
-  const script = bootScript(peekSnapshot(), await getVersion());
+  const script = bootScript(peekSnapshot(), await getVersion(), vapidKeys?.publicKey ?? null);
   return built.html.replace("</head>", () => `${script}</head>`);
+}
+
+async function readJsonBody(req) {
+  return new Promise((resolve, reject) => {
+    const chunks = [];
+    let size = 0;
+    req.on("data", (chunk) => {
+      size += chunk.length;
+      if (size > 65536) {
+        req.destroy(new Error("body too large"));
+        return;
+      }
+      chunks.push(chunk);
+    });
+    req.on("end", () => {
+      try {
+        const str = Buffer.concat(chunks).toString("utf8");
+        resolve(str ? JSON.parse(str) : {});
+      } catch (err) {
+        reject(err);
+      }
+    });
+    req.on("error", reject);
+  });
 }
 
 async function serveStatic(req, res, urlPath) {
@@ -352,6 +479,76 @@ const server = http.createServer(async (req, res) => {
   if (urlPath === "/api/version") {
     res.writeHead(200, { "Content-Type": "application/json; charset=utf-8", "Cache-Control": "no-store" });
     res.end(JSON.stringify(await getVersion()));
+    return;
+  }
+
+  if (urlPath === "/api/push/vapid-public-key" && req.method === "GET") {
+    res.writeHead(200, { "Content-Type": "application/json; charset=utf-8", "Cache-Control": "no-store" });
+    res.end(JSON.stringify({ publicKey: vapidKeys?.publicKey ?? null }));
+    return;
+  }
+
+  if (urlPath === "/api/push/subscribe" && req.method === "POST") {
+    try {
+      const body = await readJsonBody(req);
+      const added = await subscriptionStore.add(body);
+      if (!added) {
+        res.writeHead(400, { "Content-Type": "application/json", "Cache-Control": "no-store" });
+        res.end(JSON.stringify({ error: "invalid_subscription" }));
+        return;
+      }
+      const snap = cache ?? lastGood;
+      if (snap) {
+        try {
+          scheduleNextResetCheck(extractWindows(JSON.parse(snap.body)));
+        } catch {}
+      }
+      res.writeHead(200, { "Content-Type": "application/json", "Cache-Control": "no-store" });
+      res.end(JSON.stringify({ status: "subscribed", count: subscriptionStore.count() }));
+    } catch (err) {
+      res.writeHead(400, { "Content-Type": "application/json", "Cache-Control": "no-store" });
+      res.end(JSON.stringify({ error: err.message }));
+    }
+    return;
+  }
+
+  if (urlPath === "/api/push/unsubscribe" && req.method === "POST") {
+    try {
+      const body = await readJsonBody(req);
+      await subscriptionStore.remove(body.endpoint);
+      res.writeHead(200, { "Content-Type": "application/json", "Cache-Control": "no-store" });
+      res.end(JSON.stringify({ status: "unsubscribed" }));
+    } catch (err) {
+      res.writeHead(400, { "Content-Type": "application/json", "Cache-Control": "no-store" });
+      res.end(JSON.stringify({ error: err.message }));
+    }
+    return;
+  }
+
+  if (urlPath === "/api/push/test" && req.method === "POST") {
+    try {
+      const body = await readJsonBody(req);
+      const sub = subscriptionStore.all().find((s) => s.endpoint === body.endpoint) ?? body;
+      if (!sub?.endpoint || !sub?.keys?.p256dh || !sub?.keys?.auth) {
+        res.writeHead(400, { "Content-Type": "application/json", "Cache-Control": "no-store" });
+        res.end(JSON.stringify({ error: "no_valid_subscription" }));
+        return;
+      }
+      const testPayload = {
+        title: "CodexBar",
+        body: "Push notifications are working! You will be notified when a reset window is renewed.",
+        tag: "test-notification",
+        icon: "/icons/icon-192.png",
+        badge: "/icons/icon-192.png",
+        data: { url: "/", test: true },
+      };
+      const result = await sendPushNotification(sub, testPayload, vapidKeys, VAPID_SUBJECT);
+      res.writeHead(result.success ? 200 : 502, { "Content-Type": "application/json", "Cache-Control": "no-store" });
+      res.end(JSON.stringify(result));
+    } catch (err) {
+      res.writeHead(500, { "Content-Type": "application/json", "Cache-Control": "no-store" });
+      res.end(JSON.stringify({ error: err.message }));
+    }
     return;
   }
 
