@@ -349,16 +349,59 @@ function urlBase64ToUint8Array(base64String) {
 let pushSub = null;
 let vapidPublicKey = boot?.vapidPublicKey ?? null;
 
+// Asks the server every time: the key baked into __BOOT__ rides in the cached page shell,
+// which the service worker only refreshes when app.js/styles.css change — not when the
+// server regenerates its VAPID key. The boot copy is the offline fallback.
 async function getVapidPublicKey() {
-  if (vapidPublicKey) return vapidPublicKey;
   try {
     const res = await fetch("/api/push/vapid-public-key", { cache: "no-store" });
     if (res.ok) {
       const data = await res.json();
-      vapidPublicKey = data.publicKey;
+      if (data.publicKey) vapidPublicKey = data.publicKey;
     }
   } catch {}
   return vapidPublicKey;
+}
+
+// The browser can hold a subscription the server no longer knows about — pruned after
+// the push service said it was gone, or the subscriptions file was lost — or one minted
+// against a VAPID key the server has since regenerated. Either way the bell would show
+// "active" while nothing ever arrives. Re-registering is idempotent and heals the first;
+// a key mismatch needs a fresh subscription, which is silent once permission is granted.
+let reconciledEndpoint = null;
+
+async function reconcileSubscription(reg, sub) {
+  if (reconciledEndpoint === sub.endpoint) return sub;
+  const key = await getVapidPublicKey();
+  if (!key) return sub;
+  try {
+    if (!subscribedWithKey(sub, key)) {
+      if (Notification.permission !== "granted") return sub;
+      await sub.unsubscribe().catch(() => {});
+      sub = null; // if resubscribing fails, report no subscription rather than the dead one
+      sub = await reg.pushManager.subscribe({
+        userVisibleOnly: true,
+        applicationServerKey: urlBase64ToUint8Array(key),
+      });
+    }
+    const res = await fetch("/api/push/subscribe", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(sub),
+    });
+    if (res.ok) reconciledEndpoint = sub.endpoint;
+  } catch {
+    // Offline or the server is down; try again next launch.
+  }
+  return sub;
+}
+
+function subscribedWithKey(sub, serverKeyB64) {
+  const held = sub.options?.applicationServerKey;
+  if (!held) return true; // browser does not expose it; nothing to compare against
+  const a = new Uint8Array(held);
+  const b = urlBase64ToUint8Array(serverKeyB64);
+  return a.length === b.length && a.every((v, i) => v === b[i]);
 }
 
 async function syncPushState() {
@@ -377,6 +420,7 @@ async function syncPushState() {
   try {
     const reg = await navigator.serviceWorker.ready;
     pushSub = await reg.pushManager.getSubscription();
+    if (pushSub) pushSub = await reconcileSubscription(reg, pushSub);
   } catch {
     pushSub = null;
   }

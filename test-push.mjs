@@ -6,6 +6,7 @@ import {
   extractWindows,
   detectWindowRenewals,
   nextCheckDelayMs,
+  isValidSubscription,
   sendPushNotification,
 } from "./push.mjs";
 import crypto from "node:crypto";
@@ -80,7 +81,7 @@ async function runTests() {
   assert.strictEqual(store.count(), 0);
 
   const sampleSub = {
-    endpoint: "https://push.example.com/sub/123",
+    endpoint: "https://fcm.googleapis.com/fcm/send/123",
     keys: { p256dh: clientPubB64, auth: clientAuthB64 },
   };
   await store.add(sampleSub);
@@ -293,7 +294,74 @@ async function runTests() {
   }
   console.log("✓ Test 13 passed: nextCheckDelayMs scheduling");
 
-  console.log("All 13 push.mjs tests passed successfully!");
+  // Test 14: VAPID rejection is flagged and prunes the subscription after repeated failures
+  {
+    const server403 = http.createServer((req, res) => res.writeHead(403).end("VAPID mismatch"));
+    await new Promise((resolve) => server403.listen(0, "127.0.0.1", resolve));
+    const endpoint = `http://127.0.0.1:${server403.address().port}/sub/x`;
+    const r = await sendPushNotification({ endpoint, keys: { p256dh: clientPubB64, auth: clientAuthB64 } }, { t: 1 }, keys1);
+    assert.strictEqual(r.unauthorized, true, "403 must be reported as unauthorized");
+    assert.strictEqual(r.expired, undefined);
+    server403.close();
+
+    const subPath = path.join(os.tmpdir(), `test-subs-auth-${Date.now()}.json`);
+    const st = new SubscriptionStore(subPath);
+    const ep = "https://fcm.googleapis.com/fcm/send/auth";
+    await st.add({ endpoint: ep, keys: { p256dh: clientPubB64, auth: clientAuthB64 } });
+    assert.strictEqual(await st.recordAuthFailure(ep, 3), false);
+    assert.strictEqual(await st.recordAuthFailure(ep, 3), false);
+    // The client re-registering the same subscription on launch must not wipe the count.
+    await st.add({ endpoint: ep, keys: { p256dh: clientPubB64, auth: clientAuthB64 } });
+    assert.strictEqual(st.get(ep).authFailures, 2, "re-registering keeps the failure count");
+    await st.markDelivered(ep);
+    assert.strictEqual(st.get(ep).authFailures, 0, "a delivery resets the failure count");
+    for (let i = 0; i < 2; i++) await st.recordAuthFailure(ep, 3);
+    assert.strictEqual(st.count(), 1);
+    assert.strictEqual(await st.recordAuthFailure(ep, 3), true, "third consecutive failure removes it");
+    assert.strictEqual(st.count(), 0);
+    await fs.unlink(subPath).catch(() => {});
+  }
+  console.log("✓ Test 14 passed: unauthorized responses and auth-failure pruning");
+
+  // Test 15: delivery timeout — a push service that never answers does not hang the caller
+  {
+    const blackhole = http.createServer(() => { /* never respond */ });
+    await new Promise((resolve) => blackhole.listen(0, "127.0.0.1", resolve));
+    const endpoint = `http://127.0.0.1:${blackhole.address().port}/sub/hang`;
+    const started = Date.now();
+    const r = await sendPushNotification({ endpoint, keys: { p256dh: clientPubB64, auth: clientAuthB64 } }, { t: 1 }, keys1,
+      undefined, { timeoutMs: 300 });
+    assert.strictEqual(r.success, false);
+    assert(Date.now() - started < 5000, "must give up on a silent push service");
+    blackhole.closeAllConnections?.();
+    blackhole.close();
+  }
+  console.log("✓ Test 15 passed: delivery timeout");
+
+  // Test 16: subscription validation — only https endpoints with both keys
+  {
+    const keys = { p256dh: clientPubB64, auth: clientAuthB64 };
+    for (const ok of [
+      "https://fcm.googleapis.com/fcm/send/a",
+      "https://updates.push.services.mozilla.com/wpush/v2/a",
+      "https://web.push.apple.com/a",
+      "https://wns2-ln2p.notify.windows.com/w/?token=a",
+    ]) assert.strictEqual(isValidSubscription({ endpoint: ok, keys }), true, ok);
+    assert.strictEqual(isValidSubscription({ endpoint: "http://fcm.googleapis.com/fcm/send/a", keys }), false, "plain http rejected");
+    assert.strictEqual(isValidSubscription({ endpoint: "https://push.example.com/a", keys }), false, "unknown host rejected");
+    assert.strictEqual(isValidSubscription({ endpoint: "https://100.64.0.1/a", keys }), false, "tailnet address rejected");
+    assert.strictEqual(isValidSubscription({ endpoint: "https://evilfcm.googleapis.com.attacker.net/a", keys }), false, "suffix lookalike rejected");
+    assert.strictEqual(isValidSubscription({ endpoint: "https://notfcm.googleapis.com/a", keys }), false, "prefix lookalike rejected");
+    assert.strictEqual(isValidSubscription({ endpoint: "not a url", keys }), false);
+    assert.strictEqual(isValidSubscription({ endpoint: "https://fcm.googleapis.com/fcm/send/a", keys: { p256dh: clientPubB64 } }), false);
+    assert.strictEqual(isValidSubscription(null), false);
+    const st = new SubscriptionStore(path.join(os.tmpdir(), `test-subs-valid-${Date.now()}.json`));
+    assert.strictEqual(await st.add({ endpoint: "http://127.0.0.1/evil", keys }), false);
+    assert.strictEqual(st.count(), 0);
+  }
+  console.log("✓ Test 16 passed: subscription validation");
+
+  console.log("All 16 push.mjs tests passed successfully!");
 }
 
 runTests().catch((err) => {

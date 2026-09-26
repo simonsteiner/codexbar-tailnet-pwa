@@ -116,10 +116,22 @@ export function encryptWebPush(payloadText, p256dhBase64Url, authBase64Url) {
   ]);
 }
 
+// A "renewed" notice that arrives hours late is noise, so let the push service drop it
+// after an hour instead of the day the earlier default allowed.
+export const DEFAULT_PUSH_TTL_SECONDS = 3600;
+// A hung push service must not leave a delivery promise pending forever.
+export const DEFAULT_PUSH_TIMEOUT_MS = 10_000;
+
 /**
  * Send an encrypted Web Push notification to a PushSubscription.
+ *
+ * Result flags: `expired` for 404/410 (the subscription is gone, drop it), `unauthorized`
+ * for 401/403 (the VAPID key the browser subscribed with is not the one we sign with —
+ * persistent, so callers count these and drop the subscription after a few).
  */
-export async function sendPushNotification(subscription, payload, vapidKeys, subject) {
+export async function sendPushNotification(subscription, payload, vapidKeys, subject, opts = {}) {
+  const ttlSeconds = opts.ttlSeconds ?? DEFAULT_PUSH_TTL_SECONDS;
+  const timeoutMs = opts.timeoutMs ?? DEFAULT_PUSH_TIMEOUT_MS;
   if (!subscription?.endpoint || !subscription?.keys?.p256dh || !subscription?.keys?.auth) {
     return { success: false, error: "Invalid subscription" };
   }
@@ -137,14 +149,20 @@ export async function sendPushNotification(subscription, payload, vapidKeys, sub
         Authorization: authHeader,
         "Content-Type": "application/octet-stream",
         "Content-Encoding": "aes128gcm",
-        TTL: "86400",
+        TTL: String(ttlSeconds),
         Urgency: "high",
       },
       body: encrypted,
+      signal: AbortSignal.timeout(timeoutMs),
     });
 
     if (res.status === 404 || res.status === 410) {
       return { success: false, status: res.status, expired: true };
+    }
+
+    if (res.status === 401 || res.status === 403) {
+      const text = await res.text().catch(() => "");
+      return { success: false, status: res.status, unauthorized: true, error: text.slice(0, 200) };
     }
 
     if (!res.ok) {
@@ -155,6 +173,34 @@ export async function sendPushNotification(subscription, payload, vapidKeys, sub
     return { success: true, status: res.status };
   } catch (err) {
     return { success: false, error: err.message };
+  }
+}
+
+// The push services browsers actually hand out endpoints for: Chrome/Edge-on-Android (FCM),
+// Firefox (Mozilla autopush), Safari (Apple), Edge on Windows (WNS).
+const PUSH_SERVICE_HOSTS = [
+  "fcm.googleapis.com",
+  "push.services.mozilla.com",
+  "push.apple.com",
+  "notify.windows.com",
+];
+
+const isPushServiceHost = (host) =>
+  PUSH_SERVICE_HOSTS.some((h) => host === h || host.endsWith(`.${h}`));
+
+/**
+ * A subscription we are willing to store and push to. The endpoint is a URL this process
+ * will POST to on a tailnet client's say-so, so it must be https on a known push service —
+ * otherwise subscribing would turn the proxy into a relay for arbitrary (internal) hosts.
+ */
+export function isValidSubscription(sub) {
+  if (!sub?.endpoint || typeof sub.endpoint !== "string") return false;
+  if (typeof sub.keys?.p256dh !== "string" || typeof sub.keys?.auth !== "string") return false;
+  try {
+    const url = new URL(sub.endpoint);
+    return url.protocol === "https:" && isPushServiceHost(url.hostname);
+  } catch {
+    return false;
   }
 }
 
@@ -175,7 +221,7 @@ export class SubscriptionStore {
       if (Array.isArray(list)) {
         this.subscriptions.clear();
         for (const sub of list) {
-          if (sub.endpoint && sub.keys?.p256dh && sub.keys?.auth) {
+          if (isValidSubscription(sub)) {
             this.subscriptions.set(sub.endpoint, sub);
           }
         }
@@ -196,7 +242,7 @@ export class SubscriptionStore {
   }
 
   async add(sub) {
-    if (!sub?.endpoint || !sub?.keys?.p256dh || !sub?.keys?.auth) return false;
+    if (!isValidSubscription(sub)) return false;
     const now = Date.now();
     const existing = this.subscriptions.get(sub.endpoint);
     this.subscriptions.set(sub.endpoint, {
@@ -207,9 +253,45 @@ export class SubscriptionStore {
       },
       createdAt: existing?.createdAt ?? now,
       lastSeenAt: now,
+      // Same endpoint means the same subscription, minted against the same key: a client
+      // re-registering it proves nothing, so it must not wipe the VAPID-rejection count.
+      authFailures: existing?.authFailures ?? 0,
     });
     await this.save();
     return true;
+  }
+
+  get(endpoint) {
+    return this.subscriptions.get(endpoint) ?? null;
+  }
+
+  /** A delivery got through: the subscription is healthy, forget any earlier auth failures. */
+  async markDelivered(endpoint) {
+    const sub = this.subscriptions.get(endpoint);
+    if (!sub) return;
+    if (sub.authFailures) {
+      sub.authFailures = 0;
+      await this.save();
+    }
+  }
+
+  /**
+   * The push service rejected our VAPID signature for this subscription. That is usually
+   * permanent (the browser subscribed against a key we no longer hold), but a single
+   * response is not proof, so drop the subscription only after `limit` in a row.
+   * @returns {Promise<boolean>} true when the subscription was removed
+   */
+  async recordAuthFailure(endpoint, limit = 3) {
+    const sub = this.subscriptions.get(endpoint);
+    if (!sub) return false;
+    sub.authFailures = (sub.authFailures ?? 0) + 1;
+    if (sub.authFailures >= limit) {
+      this.subscriptions.delete(endpoint);
+      await this.save();
+      return true;
+    }
+    await this.save();
+    return false;
   }
 
   async remove(endpoint) {

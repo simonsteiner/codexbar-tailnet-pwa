@@ -23,6 +23,7 @@ import {
   detectWindowRenewals,
   nextCheckDelayMs,
   DEFAULT_MIN_USED_PERCENT,
+  DEFAULT_PUSH_TTL_SECONDS,
 } from "./push.mjs";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
@@ -55,11 +56,11 @@ const SUBSCRIPTIONS_PATH = process.env.CBT_PUSH_SUBSCRIPTIONS_PATH ?? path.join(
 const VAPID_SUBJECT = process.env.CBT_VAPID_SUBJECT ?? "mailto:codexbar@local";
 // A numeric env knob, or its default when unset, blank or out of range. `Number()` alone
 // turns "abc" into NaN and "" into 0, and either silently breaks renewal detection.
-function envNumber(name, fallback, { min, max = Infinity }) {
+function envNumber(name, fallback, { min, max = Infinity, integer = false }) {
   const raw = process.env[name];
   if (raw == null || raw.trim() === "") return fallback;
   const n = Number(raw);
-  if (!Number.isFinite(n) || n < min || n > max) {
+  if (!Number.isFinite(n) || n < min || n > max || (integer && !Number.isInteger(n))) {
     console.warn(`${name}=${JSON.stringify(raw)} is not valid; using ${fallback}`);
     return fallback;
   }
@@ -68,6 +69,10 @@ function envNumber(name, fallback, { min, max = Infinity }) {
 // A window whose usage never reached this much renews without a notification. Zero would
 // announce every untouched window, so the floor is just above it.
 const PUSH_MIN_USED_PERCENT = envNumber("CBT_PUSH_MIN_USED", DEFAULT_MIN_USED_PERCENT, { min: 1, max: 100 });
+// How long the push service may hold a "renewed" notice before dropping it as stale.
+const PUSH_TTL_SECONDS = envNumber("CBT_PUSH_TTL", DEFAULT_PUSH_TTL_SECONDS, { min: 0, integer: true });
+// Consecutive VAPID rejections before a subscription is treated as dead.
+const PUSH_AUTH_FAILURE_LIMIT = 3;
 
 if (!TOKEN) {
   console.error("CODEXBAR_DASHBOARD_TOKEN is not set — the snapshot route would 401. Refusing to start.");
@@ -88,6 +93,10 @@ try {
 const windowStates = new Map();
 let resetTimer = null;
 let resetRetryAttempt = 0;
+
+const endpointHost = (endpoint) => {
+  try { return new URL(endpoint).host; } catch { return "?"; }
+};
 
 function scheduleNextResetCheck(windows) {
   if (resetTimer) {
@@ -118,6 +127,33 @@ function armResetTimer(delay) {
       });
   }, Math.min(delay, 2147483647));
   resetTimer.unref?.();
+}
+
+async function deliverToAll(payload) {
+  const label = payload.title;
+  const subs = subscriptionStore.all();
+  console.log(`push: "${label}" → ${subs.length} subscription(s)`);
+  await Promise.all(subs.map(async (sub) => {
+    const host = endpointHost(sub.endpoint);
+    let res;
+    try {
+      res = await sendPushNotification(sub, payload, vapidKeys, VAPID_SUBJECT, { ttlSeconds: PUSH_TTL_SECONDS });
+    } catch (err) {
+      res = { success: false, error: err.message };
+    }
+    if (res.success) {
+      await subscriptionStore.markDelivered(sub.endpoint);
+      console.log(`push: delivered to ${host} (${res.status})`);
+    } else if (res.expired) {
+      await subscriptionStore.remove(sub.endpoint);
+      console.warn(`push: ${host} returned ${res.status}; subscription removed`);
+    } else if (res.unauthorized) {
+      const removed = await subscriptionStore.recordAuthFailure(sub.endpoint, PUSH_AUTH_FAILURE_LIMIT);
+      console.warn(`push: ${host} rejected our VAPID signature (${res.status})${removed ? "; subscription removed" : ""}`);
+    } else {
+      console.warn(`push: delivery to ${host} failed (${res.status ?? "no response"}) ${res.error ?? ""}`.trim());
+    }
+  }));
 }
 
 const pct = (n) => (n != null ? `${Math.round(n)}% left` : null);
@@ -158,14 +194,7 @@ async function handleSnapshotRenewals(snap) {
           renewedAt: new Date().toISOString(),
         },
       };
-
-      for (const sub of subscriptionStore.all()) {
-        sendPushNotification(sub, payload, vapidKeys, VAPID_SUBJECT).then((res) => {
-          if (res.expired) {
-            subscriptionStore.remove(sub.endpoint);
-          }
-        }).catch(() => {});
-      }
+      deliverToAll(payload).catch((err) => console.warn("push: delivery batch failed:", err.message));
     }
   }
 
@@ -563,10 +592,12 @@ const server = http.createServer(async (req, res) => {
   if (urlPath === "/api/push/test" && req.method === "POST") {
     try {
       const body = await readJsonBody(req);
-      const sub = subscriptionStore.all().find((s) => s.endpoint === body.endpoint) ?? body;
-      if (!sub?.endpoint || !sub?.keys?.p256dh || !sub?.keys?.auth) {
+      // Only subscriptions this server already holds: the endpoint is a URL we POST to,
+      // and a test push must not turn the proxy into a relay for arbitrary ones.
+      const sub = subscriptionStore.get(body?.endpoint);
+      if (!sub) {
         res.writeHead(400, { "Content-Type": "application/json", "Cache-Control": "no-store" });
-        res.end(JSON.stringify({ error: "no_valid_subscription" }));
+        res.end(JSON.stringify({ error: "unknown_subscription" }));
         return;
       }
       const testPayload = {
@@ -577,7 +608,8 @@ const server = http.createServer(async (req, res) => {
         badge: "/icons/icon-192.png",
         data: { url: "/", test: true },
       };
-      const result = await sendPushNotification(sub, testPayload, vapidKeys, VAPID_SUBJECT);
+      const result = await sendPushNotification(sub, testPayload, vapidKeys, VAPID_SUBJECT, { ttlSeconds: PUSH_TTL_SECONDS });
+      console.log(`push: test to ${endpointHost(sub.endpoint)} ${result.success ? "delivered" : "failed"} (${result.status ?? result.error})`);
       res.writeHead(result.success ? 200 : 502, { "Content-Type": "application/json", "Cache-Control": "no-store" });
       res.end(JSON.stringify(result));
     } catch (err) {

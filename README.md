@@ -52,6 +52,11 @@ OpenCode Go windows, weekly resets).
   used window's reset time until the drop shows up. One notification per window per half hour at most.
 - **One notification per provider**: Windows that renew together (Claude's weekly and its
   model-scoped weekly share one boundary) go out as a single notification.
+- **Self-healing subscriptions**: The app re-registers its subscription on every launch and
+  re-subscribes if the server's VAPID key changed; the server drops subscriptions the push
+  service reports gone or repeatedly rejects. Every delivery is logged to the journal.
+- **Known push services only**: Subscriptions are accepted only for https endpoints on FCM, Mozilla,
+  Apple and WNS push hosts, so a tailnet client cannot make the proxy POST to arbitrary URLs.
 - **Device UI**: Tap the bell icon in the topbar to enable/disable notifications or send a test push.
 - **iOS Note**: On iOS 16.4+, Apple requires Web Push apps to be added to the Home Screen first before
   requesting notification permissions.
@@ -135,6 +140,7 @@ Read from `~/.config/codexbar/dashboard.env` (mode 600):
 | `CBT_PUSH_SUBSCRIPTIONS_PATH` | `~/.config/codexbar/push-subscriptions.json` | Path to persistent push subscriptions |
 | `CBT_VAPID_SUBJECT` | `mailto:codexbar@local` | Subject URI in VAPID JWT claims |
 | `CBT_PUSH_MIN_USED` | `10` | Skip the renewal push for windows whose usage stayed below this percent (1–100) |
+| `CBT_PUSH_TTL` | `3600` | Seconds the push service may hold an undelivered renewal notice (integer ≥ 0) |
 
 Snapshot serving is stale-while-revalidate: a request never waits on a live provider
 fetch when any cached copy exists — it gets the cached body plus `X-Snapshot-Refreshing: true`,
