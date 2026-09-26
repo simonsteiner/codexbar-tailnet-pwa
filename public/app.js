@@ -67,6 +67,9 @@ const barWidth = (w) => Math.min(reserve(w), 100);
 /** Remaining credit balance for a provider, or null if it doesn't report one. */
 const credits = (p) => (typeof p.credits?.remainingUSD === "number" ? p.credits.remainingUSD : null);
 
+// Upstream reports provider errors as {code, message, kind}; older payloads used a bare string.
+const errText = (e) => (e == null ? null : typeof e === "string" ? e : (e.message ?? null));
+
 function esc(s) {
   return String(s ?? "")
     .replace(/&/g, "&amp;")
@@ -141,7 +144,7 @@ function renderCards(snap) {
           ${p.identity?.plan ? `<span class="badge">${esc(p.identity.plan)}</span>` : ""}
         </header>
 
-        ${p.error ? `<div class="err">${esc(p.error)}</div>` : ""}
+        ${errText(p.error) ? `<div class="err">${esc(errText(p.error))}</div>` : ""}
 
         ${wins.map((w) => {
           const res = reserve(w);
