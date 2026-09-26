@@ -21,6 +21,8 @@ import {
   SubscriptionStore,
   extractWindows,
   detectWindowRenewals,
+  nextCheckDelayMs,
+  DEFAULT_MIN_USED_PERCENT,
 } from "./push.mjs";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
@@ -51,6 +53,21 @@ const CONFIG_DIR = process.env.CBT_CONFIG_DIR ??
 const VAPID_PATH = process.env.CBT_VAPID_PATH ?? path.join(CONFIG_DIR, "vapid.json");
 const SUBSCRIPTIONS_PATH = process.env.CBT_PUSH_SUBSCRIPTIONS_PATH ?? path.join(CONFIG_DIR, "push-subscriptions.json");
 const VAPID_SUBJECT = process.env.CBT_VAPID_SUBJECT ?? "mailto:codexbar@local";
+// A numeric env knob, or its default when unset, blank or out of range. `Number()` alone
+// turns "abc" into NaN and "" into 0, and either silently breaks renewal detection.
+function envNumber(name, fallback, { min, max = Infinity }) {
+  const raw = process.env[name];
+  if (raw == null || raw.trim() === "") return fallback;
+  const n = Number(raw);
+  if (!Number.isFinite(n) || n < min || n > max) {
+    console.warn(`${name}=${JSON.stringify(raw)} is not valid; using ${fallback}`);
+    return fallback;
+  }
+  return n;
+}
+// A window whose usage never reached this much renews without a notification. Zero would
+// announce every untouched window, so the floor is just above it.
+const PUSH_MIN_USED_PERCENT = envNumber("CBT_PUSH_MIN_USED", DEFAULT_MIN_USED_PERCENT, { min: 1, max: 100 });
 
 if (!TOKEN) {
   console.error("CODEXBAR_DASHBOARD_TOKEN is not set — the snapshot route would 401. Refusing to start.");
@@ -70,6 +87,7 @@ try {
 // Window renewal detection state
 const windowStates = new Map();
 let resetTimer = null;
+let resetRetryAttempt = 0;
 
 function scheduleNextResetCheck(windows) {
   if (resetTimer) {
@@ -77,49 +95,66 @@ function scheduleNextResetCheck(windows) {
     resetTimer = null;
   }
   if (subscriptionStore.count() === 0) return;
-
-  const now = Date.now();
-  let soonestResetMs = Infinity;
-  for (const win of windows) {
-    if (!win.resetAt) continue;
-    const t = new Date(win.resetAt).getTime();
-    if (t > now && t < soonestResetMs) {
-      soonestResetMs = t;
-    }
-  }
-
-  if (Number.isFinite(soonestResetMs)) {
-    const delay = Math.max(1000, soonestResetMs - now + 3000);
-    const safeDelay = Math.min(delay, 2147483647);
-    resetTimer = setTimeout(() => {
-      resetTimer = null;
-      refresh().catch(() => {});
-    }, safeDelay);
-    resetTimer.unref?.();
-  }
+  const delay = nextCheckDelayMs(windows, windowStates, Date.now(), { minUsedPercent: PUSH_MIN_USED_PERCENT });
+  if (delay != null) armResetTimer(delay);
 }
+
+// A successful refresh re-arms this through handleSnapshotRenewals. A failed one would
+// otherwise leave the push feature silent until someone opened the app, so retry here
+// with backoff instead.
+function armResetTimer(delay) {
+  // A subscribe can re-arm while a timer-driven refresh is still in flight; keep one chain.
+  if (resetTimer) clearTimeout(resetTimer);
+  resetTimer = setTimeout(() => {
+    resetTimer = null;
+    if (subscriptionStore.count() === 0) return;
+    refresh()
+      .then(() => { resetRetryAttempt = 0; })
+      .catch((err) => {
+        resetRetryAttempt += 1;
+        const backoff = Math.min(300_000, 15_000 * 2 ** (resetRetryAttempt - 1));
+        console.warn(`push: reset check could not refresh (${err.message}); retrying in ${backoff / 1000}s`);
+        armResetTimer(backoff);
+      });
+  }, Math.min(delay, 2147483647));
+  resetTimer.unref?.();
+}
+
+const pct = (n) => (n != null ? `${Math.round(n)}% left` : null);
 
 async function handleSnapshotRenewals(snap) {
   const windows = extractWindows(snap);
-  const renewals = detectWindowRenewals(windows, windowStates);
+  const renewals = detectWindowRenewals(windows, windowStates, Date.now(), { minUsedPercent: PUSH_MIN_USED_PERCENT });
 
   if (renewals.length > 0 && subscriptionStore.count() > 0 && vapidKeys) {
+    // Windows that renew together (Claude's weekly and its model-scoped weekly share one
+    // boundary) go out as one notification per provider/account, not one each.
+    const groups = new Map();
     for (const { win } of renewals) {
-      const title = `${win.providerName} · ${win.label} renewed`;
-      const leftText = win.remainingPercent != null ? ` (${Math.round(win.remainingPercent)}% left)` : "";
-      const accountPrefix = win.accountLabel ? `${win.accountLabel}: ` : "";
-      const body = `${accountPrefix}${win.label} window has been renewed${leftText}.`;
+      const groupKey = `${win.providerId}:${win.accountLabel ?? ""}`;
+      if (!groups.has(groupKey)) groups.set(groupKey, []);
+      groups.get(groupKey).push(win);
+    }
+
+    for (const [groupKey, wins] of groups) {
+      const first = wins[0];
+      const accountPrefix = first.accountLabel ? `${first.accountLabel}: ` : "";
+      const title = `${first.providerName} · ${wins.map((w) => w.label).join(", ")} renewed`;
+      const parts = wins.map((w) => (pct(w.remainingPercent) ? `${w.label} (${pct(w.remainingPercent)})` : w.label));
+      const body = wins.length === 1
+        ? `${accountPrefix}${parts[0]} window has been renewed.`
+        : `${accountPrefix}${parts.join(", ")} windows have been renewed.`;
 
       const payload = {
         title,
         body,
-        tag: `renewal-${win.key}`,
+        tag: `renewal-${groupKey}`,
         icon: "/icons/icon-192.png",
         badge: "/icons/icon-192.png",
         data: {
           url: "/",
-          providerId: win.providerId,
-          windowKey: win.key,
+          providerId: first.providerId,
+          windowKeys: wins.map((w) => w.key),
           renewedAt: new Date().toISOString(),
         },
       };

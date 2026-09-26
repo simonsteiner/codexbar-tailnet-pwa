@@ -43,8 +43,15 @@ OpenCode Go windows, weekly resets).
 - **Proactive scheduling**: Even if the PWA is closed on your phone, the proxy computes the soonest
   upcoming reset time across all windows and schedules a proactive refresh timer when there is at
   least one active subscriber.
-- **Deduplication**: Notifications fire once per reset cycle, tracking reset boundaries and usage
-  drops to avoid spamming.
+- **Only when it matters**: A renewal means one thing — a window that was in use dropped back to
+  (near) empty. A push goes out when a window that was at least `CBT_PUSH_MIN_USED` percent used
+  loses at least that many points and lands at no more than half its previous usage. Reset times
+  are not evidence: providers slide them on every use for rolling windows and jitter them by a
+  second between polls, and `codexbar serve` may still be serving the old cycle from its cache
+  when the clock passes the boundary. The proxy re-polls once a minute for five minutes after a
+  used window's reset time until the drop shows up. One notification per window per half hour at most.
+- **One notification per provider**: Windows that renew together (Claude's weekly and its
+  model-scoped weekly share one boundary) go out as a single notification.
 - **Device UI**: Tap the bell icon in the topbar to enable/disable notifications or send a test push.
 - **iOS Note**: On iOS 16.4+, Apple requires Web Push apps to be added to the Home Screen first before
   requesting notification permissions.
@@ -127,6 +134,7 @@ Read from `~/.config/codexbar/dashboard.env` (mode 600):
 | `CBT_VAPID_PATH` | `~/.config/codexbar/vapid.json` | Path to generated/stored VAPID keys |
 | `CBT_PUSH_SUBSCRIPTIONS_PATH` | `~/.config/codexbar/push-subscriptions.json` | Path to persistent push subscriptions |
 | `CBT_VAPID_SUBJECT` | `mailto:codexbar@local` | Subject URI in VAPID JWT claims |
+| `CBT_PUSH_MIN_USED` | `10` | Skip the renewal push for windows whose usage stayed below this percent (1–100) |
 
 Snapshot serving is stale-while-revalidate: a request never waits on a live provider
 fetch when any cached copy exists — it gets the cached body plus `X-Snapshot-Refreshing: true`,

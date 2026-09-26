@@ -283,75 +283,48 @@ export function extractWindows(snapshot) {
   return windows;
 }
 
+// Renewals of windows whose usage never reached this much are not announced: a window
+// nobody touched has nothing to say when it rolls over. The same figure is the minimum
+// drop that counts as a renewal.
+export const DEFAULT_MIN_USED_PERCENT = 10;
+// One notification per window per this long, so a provider that reports usage in fits
+// and starts (40 → 5 → 40 → 5) cannot announce the same reset twice.
+export const DEFAULT_RENEWAL_COOLDOWN_MS = 30 * 60_000;
+
+const toMs = (iso) => {
+  if (!iso) return null;
+  const t = new Date(iso).getTime();
+  return Number.isFinite(t) ? t : null;
+};
+
 /**
  * Compare current windows against previous state to detect renewals.
+ *
+ * A renewal is one thing only: a window that was in use has its usage drop back to
+ * (near) empty. Concretely, the last observation was at least `minUsedPercent` used, and
+ * this one is at least that many points lower and no more than half of it.
+ *
+ * Reset times are deliberately not evidence. Providers move them for reasons that are
+ * not a reset — a rolling window slides its boundary on every use, and several jitter
+ * by a second between polls — and `codexbar serve` may still be serving the old cycle
+ * from its cache when the clock passes the boundary. Any of those used to produce a
+ * push that said "renewed" over an unchanged number.
  *
  * @param {Array} currentWindows
  * @param {Map} windowStates Map of window key -> state
  * @param {number} now Current timestamp in ms
+ * @param {{minUsedPercent?: number, cooldownMs?: number}} [opts]
  * @returns {Array} List of renewed windows with { win, prev, reason }
  */
-export function detectWindowRenewals(currentWindows, windowStates, now = Date.now()) {
+export function detectWindowRenewals(currentWindows, windowStates, now = Date.now(), opts = {}) {
+  const minUsedPercent = opts.minUsedPercent ?? DEFAULT_MIN_USED_PERCENT;
+  const cooldownMs = opts.cooldownMs ?? DEFAULT_RENEWAL_COOLDOWN_MS;
   const renewals = [];
 
   for (const win of currentWindows) {
     const prev = windowStates.get(win.key);
 
-    if (prev) {
-      const prevResetMs = prev.resetAt ? new Date(prev.resetAt).getTime() : null;
-      const currResetMs = win.resetAt ? new Date(win.resetAt).getTime() : null;
-
-      let isRenewed = false;
-      let reason = null;
-
-      // 1. Boundary advancement: current resetAt is after previous resetAt
-      if (prevResetMs && currResetMs && currResetMs > prevResetMs) {
-        if (prev.lastNotifiedResetAt !== prev.resetAt) {
-          isRenewed = true;
-          reason = "boundary_advanced";
-        }
-      }
-      // 2. Scheduled reset time reached: previous reset time has arrived or elapsed,
-      // and either currentResetAt advanced, usage dropped, remaining percent increased,
-      // or at least 5 seconds elapsed past the scheduled reset.
-      else if (prevResetMs && now >= prevResetMs && prev.lastNotifiedResetAt !== prev.resetAt) {
-        const usageDropped = prev.usedPercent != null && prev.usedPercent > 0 &&
-          win.usedPercent != null && win.usedPercent < prev.usedPercent;
-        const remainingIncreased = prev.remainingPercent != null && prev.remainingPercent < 100 &&
-          win.remainingPercent != null && win.remainingPercent > prev.remainingPercent;
-        const graceElapsed = now >= prevResetMs + 5000;
-
-        if (usageDropped || remainingIncreased || graceElapsed) {
-          isRenewed = true;
-          reason = usageDropped ? "usage_dropped" : remainingIncreased ? "remaining_restored" : "time_elapsed";
-        }
-      }
-      // 3. Fallback for duration-less / resetAt-less windows: usage dropped from > 20% to <= 5%
-      else if (!prevResetMs && prev.usedPercent != null && prev.usedPercent > 20 &&
-               win.usedPercent != null && win.usedPercent <= 5) {
-        const cooldownBucket = `${win.key}:${Math.floor(now / (3600 * 1000))}`;
-        if (prev.lastNotifiedResetAt !== cooldownBucket) {
-          isRenewed = true;
-          reason = "quota_restored_heuristic";
-          prev.lastNotifiedResetAt = cooldownBucket;
-        }
-      }
-
-      if (isRenewed) {
-        renewals.push({ win, prev, reason });
-        prev.lastNotifiedResetAt = prev.resetAt || win.resetAt || String(now);
-      }
-
-      // Update tracked state
-      prev.resetAt = win.resetAt;
-      prev.usedPercent = win.usedPercent;
-      prev.remainingPercent = win.remainingPercent;
-      prev.providerName = win.providerName;
-      prev.windowLabel = win.label;
-      prev.accountLabel = win.accountLabel;
-    } else {
-      // First time tracking this window
-      const isPast = win.resetAt && new Date(win.resetAt).getTime() <= now;
+    if (!prev) {
       windowStates.set(win.key, {
         providerName: win.providerName,
         accountLabel: win.accountLabel,
@@ -359,11 +332,71 @@ export function detectWindowRenewals(currentWindows, windowStates, now = Date.no
         resetAt: win.resetAt,
         usedPercent: win.usedPercent,
         remainingPercent: win.remainingPercent,
-        // If already in the past at startup, mark as already notified so we don't spam on boot
-        lastNotifiedResetAt: isPast ? win.resetAt : null,
+        lastNotifiedAt: null,
       });
+      continue;
     }
+
+    const wasUsed = prev.usedPercent != null && prev.usedPercent >= minUsedPercent;
+    const dropped = wasUsed && win.usedPercent != null &&
+      prev.usedPercent - win.usedPercent >= minUsedPercent &&
+      win.usedPercent <= prev.usedPercent / 2;
+    const cooledDown = prev.lastNotifiedAt == null || now - prev.lastNotifiedAt >= cooldownMs;
+
+    if (dropped && cooledDown) {
+      renewals.push({ win, prev, reason: "usage_dropped" });
+      prev.lastNotifiedAt = now;
+    }
+
+    prev.resetAt = win.resetAt;
+    prev.usedPercent = win.usedPercent;
+    prev.remainingPercent = win.remainingPercent;
+    prev.providerName = win.providerName;
+    prev.windowLabel = win.label;
+    prev.accountLabel = win.accountLabel;
   }
 
   return renewals;
+}
+
+/**
+ * How long until the proxy should next fetch a snapshot on the push feature's behalf,
+ * or null when nothing is worth waiting for.
+ *
+ * Two triggers: the soonest future reset time (plus a small lead, so the fetch lands
+ * after the provider has rolled over), and any used window whose reset time has passed
+ * without the usage drop showing up yet. The latter is re-polled every `retryMs` for
+ * `retryWindowMs`, because upstream may still be serving the pre-reset cycle from its
+ * cache — but only while the window still reads as used, and not once this reset has
+ * already been announced.
+ *
+ * @param {Array} windows
+ * @param {Map} windowStates
+ * @param {number} now
+ * @param {{leadMs?: number, retryMs?: number, retryWindowMs?: number, minUsedPercent?: number}} [opts]
+ * @returns {number|null} delay in ms, never below one second
+ */
+export function nextCheckDelayMs(windows, windowStates, now = Date.now(), opts = {}) {
+  const leadMs = opts.leadMs ?? 3000;
+  // `codexbar serve` caches for --refresh-interval (60 s here) and a cold fetch takes
+  // ~13 s, so polling faster than once a minute only re-reads its cache.
+  const retryMs = opts.retryMs ?? 60_000;
+  const retryWindowMs = opts.retryWindowMs ?? 5 * 60_000;
+  const minUsedPercent = opts.minUsedPercent ?? DEFAULT_MIN_USED_PERCENT;
+
+  let delay = Infinity;
+  for (const win of windows) {
+    const t = toMs(win.resetAt);
+    if (t == null) continue;
+    if (t > now) {
+      delay = Math.min(delay, t - now + leadMs);
+      continue;
+    }
+    const state = windowStates.get(win.key);
+    if (!state) continue;
+    if (state.usedPercent == null || state.usedPercent < minUsedPercent) continue;
+    if (state.lastNotifiedAt != null && state.lastNotifiedAt >= t) continue;
+    if (now - t <= retryWindowMs) delay = Math.min(delay, retryMs);
+  }
+  return Number.isFinite(delay) ? Math.max(1000, delay) : null;
 }

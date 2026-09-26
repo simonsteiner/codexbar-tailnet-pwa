@@ -5,6 +5,7 @@ import {
   SubscriptionStore,
   extractWindows,
   detectWindowRenewals,
+  nextCheckDelayMs,
   sendPushNotification,
 } from "./push.mjs";
 import crypto from "node:crypto";
@@ -139,7 +140,7 @@ async function runTests() {
   assert.strictEqual(states.size, 2);
   console.log("✓ Test 6 passed: Renewal detection baseline");
 
-  // Test 7: Renewal detection - boundary advancement
+  // Test 7: a used window whose usage drops back to empty renews, once
   const advancedSnapshot = JSON.parse(JSON.stringify(sampleSnapshot));
   advancedSnapshot.providers[0].windows[0].resetAt = "2026-09-03T22:00:00Z";
   advancedSnapshot.providers[0].windows[0].usedPercent = 0;
@@ -149,28 +150,34 @@ async function runTests() {
   const detected = detectWindowRenewals(advancedWindows, states, now + 1000);
   assert.strictEqual(detected.length, 1, "Should detect 1 renewed window");
   assert.strictEqual(detected[0].win.key, "claude::Session");
-  assert.strictEqual(detected[0].reason, "boundary_advanced");
+  assert.strictEqual(detected[0].reason, "usage_dropped");
 
-  // Subsequent check should NOT re-trigger
   const recheck = detectWindowRenewals(advancedWindows, states, now + 2000);
   assert.strictEqual(recheck.length, 0, "Subsequent check should not re-trigger renewal");
-  console.log("✓ Test 7 passed: Renewal boundary advancement and deduplication");
+  console.log("✓ Test 7 passed: usage drop renews once");
 
-  // Test 8: Renewal detection - scheduled reset time elapsed with usage drop
-  const snap3 = JSON.parse(JSON.stringify(sampleSnapshot));
-  const states3 = new Map();
-  const t0 = new Date("2026-09-03T17:50:00Z").getTime();
-  detectWindowRenewals(extractWindows(snap3), states3, t0);
-
-  // Time travels past resetAt (18:00:00Z) to 18:00:05Z, usage drops from 80% to 0%
-  const t1 = new Date("2026-09-03T18:00:05Z").getTime();
-  snap3.providers[0].windows[0].usedPercent = 0;
-  snap3.providers[0].windows[0].remainingPercent = 100;
-
-  const detectedElapsed = detectWindowRenewals(extractWindows(snap3), states3, t1);
-  assert.strictEqual(detectedElapsed.length, 1, "Should detect renewal when reset time elapses and usage drops");
-  assert.strictEqual(detectedElapsed[0].win.key, "claude::Session");
-  console.log("✓ Test 8 passed: Renewal detection on time elapsed with usage restoration");
+  // Test 8: a moved reset time is not a renewal; a drop under a stale reset time is
+  {
+    const st = new Map();
+    const t0 = new Date("2026-09-04T08:00:00Z").getTime();
+    const weekly = (over) => extractWindows({
+      providers: [{ id: "opencodego", name: "OpenCode Go", enabled: true, windows: [
+        { kind: "weekly", label: "Weekly", usedPercent: 13.5, remainingPercent: 86.5, resetAt: "2026-09-06T23:59:59Z", ...over },
+      ] }],
+    });
+    detectWindowRenewals(weekly(), st, t0);
+    // The provider slides the boundary and shaves half a point: what produced the false push.
+    const slid = detectWindowRenewals(weekly({ usedPercent: 13, remainingPercent: 87, resetAt: "2026-09-08T23:59:59Z" }), st, t0 + 60_000);
+    assert.strictEqual(slid.length, 0, "a moved reset time with unchanged usage is not a renewal");
+    // Jitter by a second, same usage: nothing.
+    const jitter = detectWindowRenewals(weekly({ usedPercent: 13, remainingPercent: 87, resetAt: "2026-09-09T00:00:00Z" }), st, t0 + 120_000);
+    assert.strictEqual(jitter.length, 0, "reset-time jitter is not a renewal");
+    // Usage collapses while the provider still reports the old boundary: that is one.
+    const dropped = detectWindowRenewals(weekly({ usedPercent: 0, remainingPercent: 100, resetAt: "2026-09-09T00:00:00Z" }), st, t0 + 180_000);
+    assert.strictEqual(dropped.length, 1, "usage dropping to empty renews even with a stale boundary");
+    assert.strictEqual(dropped[0].reason, "usage_dropped");
+  }
+  console.log("✓ Test 8 passed: reset-time movement alone never renews");
 
   // Test 9: Expired subscription handling (410 Gone)
   const mockServer = http.createServer((req, res) => {
@@ -189,7 +196,104 @@ async function runTests() {
   mockServer.close();
   console.log("✓ Test 9 passed: Expired subscription detection on HTTP 410");
 
-  console.log("All 9 push.mjs tests passed successfully!");
+  // Test 10: a window that sat at 0% renews silently — on the clock, and when its boundary moves
+  {
+    const st = new Map();
+    const t0 = new Date("2026-09-04T09:00:00Z").getTime();
+    const idleWin = (over) => extractWindows({
+      providers: [{ id: "opencodego", name: "OpenCode Go", enabled: true, windows: [
+        { kind: "session", label: "5-hour", usedPercent: 0, remainingPercent: 100, resetAt: "2026-09-04T09:58:14Z", ...over },
+      ] }],
+    });
+    detectWindowRenewals(idleWin(), st, t0);
+    assert.strictEqual(detectWindowRenewals(idleWin(), st, t0 + 60 * 60_000).length, 0,
+      "0% window passing its reset time must not renew");
+    assert.strictEqual(detectWindowRenewals(idleWin({ resetAt: "2026-09-04T14:58:14Z" }), st, t0 + 61 * 60_000).length, 0,
+      "0% window whose boundary advances must not renew");
+    // Below-threshold usage that clears is still not worth a push.
+    detectWindowRenewals(idleWin({ resetAt: "2026-09-04T14:58:14Z", usedPercent: 6, remainingPercent: 94 }), st, t0 + 62 * 60_000);
+    assert.strictEqual(detectWindowRenewals(idleWin({ resetAt: "2026-09-04T19:58:14Z" }), st, t0 + 6 * 60 * 60_000).length, 0,
+      "a barely-used window clearing must not renew");
+    // Real usage that clears does.
+    detectWindowRenewals(idleWin({ resetAt: "2026-09-04T19:58:14Z", usedPercent: 40, remainingPercent: 60 }), st, t0 + 7 * 60 * 60_000);
+    const renewed = detectWindowRenewals(idleWin({ resetAt: "2026-09-05T00:58:14Z" }), st, t0 + 11 * 60 * 60_000);
+    assert.strictEqual(renewed.length, 1, "a used window renews when its usage clears");
+  }
+  console.log("✓ Test 10 passed: untouched and barely-used windows renew silently");
+
+  // Test 11: the clock alone is never evidence — stale upstream numbers past the reset time
+  {
+    const st = new Map();
+    const t0 = new Date("2026-09-04T09:00:00Z").getTime();
+    const win = (over) => extractWindows({
+      providers: [{ id: "claude", name: "Claude", enabled: true, windows: [
+        { kind: "session", label: "Session", usedPercent: 82, remainingPercent: 18, resetAt: "2026-09-04T09:49:59Z", ...over },
+      ] }],
+    });
+    detectWindowRenewals(win(), st, t0);
+    const stale = detectWindowRenewals(win(), st, new Date("2026-09-04T09:50:02Z").getTime());
+    assert.strictEqual(stale.length, 0, "unchanged numbers past the reset time must not renew");
+    const later = detectWindowRenewals(win(), st, new Date("2026-09-04T09:51:00Z").getTime());
+    assert.strictEqual(later.length, 0, "still no renewal a minute later on identical numbers");
+    // The real cycle arrives, with a little use already on it: exactly one renewal.
+    const fresh = detectWindowRenewals(win({ usedPercent: 3, remainingPercent: 97, resetAt: "2026-09-04T14:49:59Z" }),
+      st, new Date("2026-09-04T09:51:30Z").getTime());
+    assert.strictEqual(fresh.length, 1);
+    assert.strictEqual(fresh[0].win.remainingPercent, 97);
+    assert.strictEqual(detectWindowRenewals(fresh.map((r) => r.win), st, new Date("2026-09-04T09:52:00Z").getTime()).length, 0);
+  }
+  console.log("✓ Test 11 passed: no renewal on time alone; one renewal once usage really drops");
+
+  // Test 12: partial drops and flapping usage
+  {
+    const st = new Map();
+    const t0 = new Date("2026-09-04T09:00:00Z").getTime();
+    const win = (used, resetAt = "2026-09-06T23:59:59Z") => extractWindows({
+      providers: [{ id: "p", name: "P", enabled: true, windows: [
+        { kind: "weekly", label: "Weekly", usedPercent: used, remainingPercent: 100 - used, resetAt },
+      ] }],
+    });
+    detectWindowRenewals(win(60), st, t0);
+    assert.strictEqual(detectWindowRenewals(win(45), st, t0 + 60_000).length, 0, "a 15-point slide of a rolling window is not a renewal");
+    assert.strictEqual(detectWindowRenewals(win(5), st, t0 + 120_000).length, 1, "a collapse is");
+    // Flapping provider: back up to 40, then down to 5 again within the cooldown.
+    detectWindowRenewals(win(40), st, t0 + 180_000);
+    assert.strictEqual(detectWindowRenewals(win(5), st, t0 + 240_000).length, 0, "second drop inside the cooldown is swallowed");
+    detectWindowRenewals(win(40), st, t0 + 31 * 60_000);
+    assert.strictEqual(detectWindowRenewals(win(5), st, t0 + 32 * 60_000).length, 1, "a drop after the cooldown counts again");
+    // Below-threshold drops never count regardless of ratio.
+    detectWindowRenewals(win(9), st, t0 + 40 * 60_000);
+    assert.strictEqual(detectWindowRenewals(win(0), st, t0 + 70 * 60_000).length, 0, "9% clearing is below the threshold");
+  }
+  console.log("✓ Test 12 passed: partial slides and flapping usage do not renew");
+
+  // Test 13: nextCheckDelayMs — lead before a reset, bounded retries after one
+  {
+    const st = new Map();
+    const now = new Date("2026-09-04T09:00:00Z").getTime();
+    const mk = (label, usedPercent, resetAt) => ({ key: `p::${label}`, resetAt, usedPercent, remainingPercent: 100 - usedPercent,
+      providerId: "p", providerName: "P", label, kind: null, accountLabel: null });
+    const future = mk("future", 50, "2026-09-04T09:10:00Z");
+    const pastUsed = mk("pastUsed", 50, "2026-09-04T08:59:00Z");
+    const pastIdle = mk("pastIdle", 0, "2026-09-04T08:59:00Z");
+    const pastOld = mk("pastOld", 50, "2026-09-04T08:00:00Z");
+    const pastSix = mk("pastSix", 50, "2026-09-04T08:54:00Z");
+    detectWindowRenewals([future, pastUsed, pastIdle, pastOld, pastSix], st, now - 3600_000 - 1);
+
+    assert.strictEqual(nextCheckDelayMs([future], st, now), 10 * 60_000 + 3000, "future reset: wait until just after it");
+    assert.strictEqual(nextCheckDelayMs([pastUsed], st, now), 60_000, "used window past its reset: retry once a minute");
+    assert.strictEqual(nextCheckDelayMs([pastIdle], st, now), null, "idle window past its reset: nothing to chase");
+    assert.strictEqual(nextCheckDelayMs([pastOld], st, now), null, "retry window exhausted: give up");
+    assert.strictEqual(nextCheckDelayMs([future, pastUsed], st, now), 60_000, "soonest trigger wins");
+    assert.strictEqual(nextCheckDelayMs([pastSix], st, now), null, "gives up after five minutes");
+    assert.strictEqual(nextCheckDelayMs([pastSix], st, now - 2 * 60_000), 60_000, "still chasing four minutes in");
+    st.get(pastUsed.key).lastNotifiedAt = now - 10_000;
+    assert.strictEqual(nextCheckDelayMs([pastUsed], st, now), null, "announced reset is not chased");
+    assert.strictEqual(nextCheckDelayMs([], st, now), null);
+  }
+  console.log("✓ Test 13 passed: nextCheckDelayMs scheduling");
+
+  console.log("All 13 push.mjs tests passed successfully!");
 }
 
 runTests().catch((err) => {
