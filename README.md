@@ -138,6 +138,7 @@ Read from `~/.config/codexbar/dashboard.env` (mode 600):
 | `CBT_POLL` | `45` | Background refresh cadence while inside the active window |
 | `CBT_VAPID_PATH` | `~/.config/codexbar/vapid.json` | Path to generated/stored VAPID keys |
 | `CBT_PUSH_SUBSCRIPTIONS_PATH` | `~/.config/codexbar/push-subscriptions.json` | Path to persistent push subscriptions |
+| `CBT_PUSH_STATE_PATH` | `~/.config/codexbar/push-window-state.json` | Last-seen usage per window, so a restart does not lose a pending renewal (ignored when over an hour old) |
 | `CBT_VAPID_SUBJECT` | `mailto:codexbar@local` | Subject URI in VAPID JWT claims |
 | `CBT_PUSH_MIN_USED` | `10` | Skip the renewal push for windows whose usage stayed below this percent (1–100) |
 | `CBT_PUSH_TTL` | `3600` | Seconds the push service may hold an undelivered renewal notice (integer ≥ 0) |

@@ -7,6 +7,8 @@ import {
   detectWindowRenewals,
   nextCheckDelayMs,
   isValidSubscription,
+  loadWindowStates,
+  saveWindowStates,
   sendPushNotification,
 } from "./push.mjs";
 import crypto from "node:crypto";
@@ -361,7 +363,52 @@ async function runTests() {
   }
   console.log("✓ Test 16 passed: subscription validation");
 
-  console.log("All 16 push.mjs tests passed successfully!");
+  // Test 17: detection state survives a restart, but not a long outage
+  {
+    const statePath = path.join(os.tmpdir(), `test-window-state-${Date.now()}.json`);
+    const t0 = new Date("2026-09-04T09:00:00Z").getTime();
+    const win = (used) => extractWindows({
+      providers: [{ id: "claude", name: "Claude", enabled: true, windows: [
+        { kind: "session", label: "Session", usedPercent: used, remainingPercent: 100 - used, resetAt: "2026-09-04T09:49:59Z" },
+      ] }],
+    });
+    const before = new Map();
+    detectWindowRenewals(win(82), before, t0);
+    await saveWindowStates(statePath, before, t0);
+
+    // Restarted across the reset: the first post-restart poll still sees the drop.
+    const after = await loadWindowStates(statePath, t0 + 5 * 60_000);
+    assert.strictEqual(after.get("claude::Session").usedPercent, 82);
+    assert.strictEqual(detectWindowRenewals(win(2), after, t0 + 6 * 60_000).length, 1, "renewal survives a restart");
+
+    // Down for longer than the max age: start fresh rather than announce an old reset.
+    assert.strictEqual((await loadWindowStates(statePath, t0 + 2 * 3600_000)).size, 0, "stale state is discarded");
+
+    await fs.writeFile(statePath, "{not json");
+    assert.strictEqual((await loadWindowStates(statePath, t0)).size, 0, "corrupt file starts empty");
+    assert.strictEqual((await loadWindowStates(`${statePath}.missing`, t0)).size, 0, "missing file starts empty");
+    const leftovers = (await fs.readdir(os.tmpdir())).filter((f) => f.startsWith(path.basename(statePath)) && f.endsWith(".tmp"));
+    assert.strictEqual(leftovers.length, 0, "no temp files left behind");
+    await fs.unlink(statePath).catch(() => {});
+  }
+  console.log("✓ Test 17 passed: window state persistence");
+
+  // Test 18: a window that reports only remainingPercent is still tracked
+  {
+    const [w] = extractWindows({ providers: [{ id: "p", name: "P", windows: [
+      { kind: "weekly", label: "Weekly", remainingPercent: 30, resetAt: null },
+    ] }] });
+    assert.strictEqual(w.usedPercent, 70);
+    const st = new Map();
+    detectWindowRenewals([w], st, 0);
+    const [fresh] = extractWindows({ providers: [{ id: "p", name: "P", windows: [
+      { kind: "weekly", label: "Weekly", remainingPercent: 100, resetAt: null },
+    ] }] });
+    assert.strictEqual(detectWindowRenewals([fresh], st, 60_000).length, 1, "remaining-only window renews");
+  }
+  console.log("✓ Test 18 passed: usedPercent derived from remainingPercent");
+
+  console.log("All 18 push.mjs tests passed successfully!");
 }
 
 runTests().catch((err) => {

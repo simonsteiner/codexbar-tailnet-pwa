@@ -315,6 +315,12 @@ export class SubscriptionStore {
 /**
  * Extract rate limit windows from a snapshot.
  */
+// Detection reads usedPercent; a window that only reports what is left still has one.
+const usedOf = (win) =>
+  win.usedPercent != null ? Number(win.usedPercent)
+    : win.remainingPercent != null ? 100 - Number(win.remainingPercent)
+    : null;
+
 export function extractWindows(snapshot) {
   const windows = [];
   if (!snapshot?.providers) return windows;
@@ -335,7 +341,7 @@ export function extractWindows(snapshot) {
         accountLabel: null,
         label: win.label || win.kind || "Window",
         kind: win.kind || null,
-        usedPercent: win.usedPercent != null ? Number(win.usedPercent) : null,
+        usedPercent: usedOf(win),
         remainingPercent: win.remainingPercent != null ? Number(win.remainingPercent) : null,
         resetAt: win.resetAt || null,
       });
@@ -354,7 +360,7 @@ export function extractWindows(snapshot) {
           accountLabel: acc.label || acc.id || null,
           label: win.label || win.kind || "Window",
           kind: win.kind || null,
-          usedPercent: win.usedPercent != null ? Number(win.usedPercent) : null,
+          usedPercent: usedOf(win),
           remainingPercent: win.remainingPercent != null ? Number(win.remainingPercent) : null,
           resetAt: win.resetAt || null,
         });
@@ -363,6 +369,46 @@ export function extractWindows(snapshot) {
   }
 
   return windows;
+}
+
+// Saved detection state older than this is discarded on load: the restart gap it bridges
+// is normally seconds, and a drop seen after a long outage is a reset that already
+// happened, not news. The server re-stamps the file on shutdown, so its age measures
+// downtime rather than how long usage sat still.
+export const DEFAULT_WINDOW_STATE_MAX_AGE_MS = 60 * 60_000;
+
+/**
+ * Load the per-window detection state saved by saveWindowStates, so a restart between a
+ * reset and the next poll does not lose the pre-reset usage the renewal is measured
+ * against (nor the per-window cooldown). Missing, unreadable or stale files start empty.
+ * @returns {Promise<Map>}
+ */
+export async function loadWindowStates(filePath, now = Date.now(), maxAgeMs = DEFAULT_WINDOW_STATE_MAX_AGE_MS) {
+  const states = new Map();
+  try {
+    const saved = JSON.parse(await fs.readFile(filePath, "utf8"));
+    if (!(now - saved?.savedAt <= maxAgeMs)) return states;
+    for (const [key, state] of Object.entries(saved.windows ?? {})) {
+      if (state && typeof state === "object") states.set(key, state);
+    }
+  } catch {
+    // File missing or invalid JSON; start empty
+  }
+  return states;
+}
+
+/** Persist detection state; written to a temp file and renamed so a crash cannot truncate it. */
+export async function saveWindowStates(filePath, states, now = Date.now()) {
+  // Unique per call: a detection pass and the shutdown stamp can overlap.
+  const tmp = `${filePath}.${crypto.randomUUID()}.tmp`;
+  try {
+    await fs.mkdir(path.dirname(filePath), { recursive: true, mode: 0o700 });
+    await fs.writeFile(tmp, JSON.stringify({ savedAt: now, windows: Object.fromEntries(states) }), { mode: 0o600, encoding: "utf8" });
+    await fs.rename(tmp, filePath);
+  } catch (err) {
+    await fs.unlink(tmp).catch(() => {});
+    console.warn(`Could not save window state to ${filePath}:`, err.message);
+  }
 }
 
 // Renewals of windows whose usage never reached this much are not announced: a window

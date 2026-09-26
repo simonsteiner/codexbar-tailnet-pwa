@@ -22,6 +22,8 @@ import {
   extractWindows,
   detectWindowRenewals,
   nextCheckDelayMs,
+  loadWindowStates,
+  saveWindowStates,
   DEFAULT_MIN_USED_PERCENT,
   DEFAULT_PUSH_TTL_SECONDS,
 } from "./push.mjs";
@@ -53,6 +55,7 @@ const CONFIG_DIR = process.env.CBT_CONFIG_DIR ??
     : path.join(os.homedir(), ".config", "codexbar"));
 const VAPID_PATH = process.env.CBT_VAPID_PATH ?? path.join(CONFIG_DIR, "vapid.json");
 const SUBSCRIPTIONS_PATH = process.env.CBT_PUSH_SUBSCRIPTIONS_PATH ?? path.join(CONFIG_DIR, "push-subscriptions.json");
+const WINDOW_STATE_PATH = process.env.CBT_PUSH_STATE_PATH ?? path.join(CONFIG_DIR, "push-window-state.json");
 const VAPID_SUBJECT = process.env.CBT_VAPID_SUBJECT ?? "mailto:codexbar@local";
 // A numeric env knob, or its default when unset, blank or out of range. `Number()` alone
 // turns "abc" into NaN and "" into 0, and either silently breaks renewal detection.
@@ -90,7 +93,19 @@ try {
 }
 
 // Window renewal detection state
-const windowStates = new Map();
+const windowStates = await loadWindowStates(WINDOW_STATE_PATH);
+if (windowStates.size > 0) console.log(`push: restored usage state for ${windowStates.size} window(s)`);
+// Last state written, so a poll that changed nothing does not rewrite the file.
+let savedWindowStates = JSON.stringify(Object.fromEntries(windowStates));
+
+// Re-stamp the state on the way down: the file is only rewritten when usage changes, so
+// without this its age after a restart would be how long usage sat still, and a quiet
+// afternoon would get it discarded as stale.
+for (const signal of ["SIGTERM", "SIGINT"]) {
+  process.once(signal, () => {
+    saveWindowStates(WINDOW_STATE_PATH, windowStates).finally(() => process.exit(0));
+  });
+}
 let resetTimer = null;
 let resetRetryAttempt = 0;
 
@@ -161,6 +176,11 @@ const pct = (n) => (n != null ? `${Math.round(n)}% left` : null);
 async function handleSnapshotRenewals(snap) {
   const windows = extractWindows(snap);
   const renewals = detectWindowRenewals(windows, windowStates, Date.now(), { minUsedPercent: PUSH_MIN_USED_PERCENT });
+  const stateJson = JSON.stringify(Object.fromEntries(windowStates));
+  if (stateJson !== savedWindowStates) {
+    savedWindowStates = stateJson;
+    await saveWindowStates(WINDOW_STATE_PATH, windowStates);
+  }
 
   if (renewals.length > 0 && subscriptionStore.count() > 0 && vapidKeys) {
     // Windows that renew together (Claude's weekly and its model-scoped weekly share one
