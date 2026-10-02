@@ -330,13 +330,13 @@ let lastGood = null;
 /** @type {Promise<{body: string, at: number}> | null} */
 let inFlight = null;
 
-function fetchSnapshot() {
+function fetchUpstream(upstreamPath) {
   return new Promise((resolve, reject) => {
     const req = http.request(
       {
         host: UPSTREAM_HOST,
         port: UPSTREAM_PORT,
-        path: "/dashboard/v1/snapshot",
+        path: upstreamPath,
         method: "GET",
         headers: {
           // The whole reason this proxy exists. node:http lets us set Host directly;
@@ -364,6 +364,8 @@ function fetchSnapshot() {
     req.end();
   });
 }
+
+const fetchSnapshot = () => fetchUpstream("/dashboard/v1/snapshot");
 
 // Coalesce concurrent refreshes into one upstream call, mirroring what `serve` does internally.
 function refresh() {
@@ -422,6 +424,63 @@ setInterval(() => {
 
 // Prewarm at boot so even the first-ever request finds a cache.
 refresh().catch(() => {});
+
+/* ---------------- spend history (`serve /cost`) ---------------- */
+
+// Only the Spend view asks for this, so it is fetched on demand and never polled. Spend
+// moves slowly and `/cost` is a local log scan, so it gets its own, longer TTL.
+const COST_TTL_MS = envNumber("CBT_COST_TTL", 300, { min: 0 }) * 1000;
+
+/** @type {{body: string, at: number} | null} */
+let costCache = null;
+/** @type {Promise<{body: string, at: number}> | null} */
+let costInFlight = null;
+
+// What the phone needs from `/cost`: per-day totals with their model split. Codex's
+// `projects[]` repeats every day once per project and carries local filesystem paths,
+// so it is dropped rather than shipped over the tailnet to be ignored.
+function trimCost(body) {
+  const rows = JSON.parse(body);
+  const providers = (Array.isArray(rows) ? rows : [rows]).map(({ projects, daily, totals, ...rest }) => ({
+    ...rest,
+    totals: totals
+      ? { totalCost: totals.totalCost, totalTokens: totals.totalTokens, incompleteRequestCount: totals.incompleteRequestCount }
+      : null,
+    daily: (daily ?? []).map((d) => ({
+      date: d.date,
+      totalCost: d.totalCost,
+      totalTokens: d.totalTokens,
+      incompleteRequestCount: d.incompleteRequestCount,
+      modelBreakdowns: (d.modelBreakdowns ?? []).map((m) => ({ modelName: m.modelName, cost: m.cost })),
+    })),
+  }));
+  return JSON.stringify({ generatedAt: new Date().toISOString(), providers });
+}
+
+function refreshCost() {
+  if (!costInFlight) {
+    costInFlight = fetchUpstream("/cost")
+      .then((fresh) => {
+        costCache = { body: trimCost(fresh.body), at: fresh.at };
+        return costCache;
+      })
+      .finally(() => {
+        costInFlight = null;
+      });
+  }
+  return costInFlight;
+}
+
+// Same stale-while-revalidate policy as getSnapshot().
+async function getCost() {
+  if (costCache && Date.now() - costCache.at < COST_TTL_MS) return { ...costCache, refreshing: false };
+  const pending = refreshCost();
+  if (costCache) {
+    pending.catch(() => {});
+    return { ...costCache, refreshing: true };
+  }
+  return { ...(await pending), refreshing: false };
+}
 
 // Nothing in an inlined document can close the tag that carries it. CSS and JS never
 // legitimately contain these sequences outside a string, where the escape is a no-op.
@@ -662,6 +721,23 @@ const server = http.createServer(async (req, res) => {
         }, lastGood.body, shouldGzip(req, json, Buffer.byteLength(lastGood.body)));
         return;
       }
+      res.writeHead(502, { "Content-Type": "application/json", "Cache-Control": "no-store" });
+      res.end(JSON.stringify({ error: "upstream_unavailable", detail: String(err.message) }));
+    }
+    return;
+  }
+
+  if (urlPath === "/api/cost") {
+    const json = "application/json; charset=utf-8";
+    try {
+      const cost = await getCost();
+      sendBody(req, res, 200, {
+        "Content-Type": json,
+        "Cache-Control": "no-store",
+        "X-Snapshot-Refreshing": String(cost.refreshing),
+        "X-Snapshot-Age": String(Math.round((Date.now() - cost.at) / 1000)),
+      }, cost.body, shouldGzip(req, json, Buffer.byteLength(cost.body)));
+    } catch (err) {
       res.writeHead(502, { "Content-Type": "application/json", "Cache-Control": "no-store" });
       res.end(JSON.stringify({ error: "upstream_unavailable", detail: String(err.message) }));
     }

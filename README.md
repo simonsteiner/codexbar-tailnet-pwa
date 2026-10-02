@@ -14,14 +14,20 @@ Android/iOS PWA ──https──▶ tailscale serve ──▶ node :8899 (loopb
                                                  │                      + Host: 127.0.0.1
                                                  │                      + Authorization: Bearer …
                                                  │                                       codexbar serve
+                                                 ├── /api/cost     ──▶ 127.0.0.1:8087/cost (trimmed)
                                                  └── /api/push/*   Web Push notifications
 ```
 
-Three views, remembered across launches:
+Four views, remembered across launches:
 
 - **Cards** — provider tiles with per-window usage bars, plan badges, credits and cost.
 - **Resets** — every window across every provider, soonest reset first, with large countdowns.
 - **Dense** — one compact row per window.
+- **Spend** — today's and 30-day spend, then per provider a 30-day daily chart and the cost split
+  by model; tap a day to see that day's split. Comes from `codexbar serve`'s `/cost` (local log
+  scans priced at API list rates, so for a subscription it is a usage measure, not a bill). The
+  proxy drops Codex's per-project rows, which carry local paths, and is only asked for spend
+  while this view is open.
 
 Every view leads with the *reserve* — the headroom left rather than the amount burnt: `35% left`
 per window (with `65% used` alongside it) and the remaining credit balance for providers that
@@ -133,6 +139,7 @@ Read from `~/.config/codexbar/dashboard.env` (mode 600):
 | `CBT_BIND` | `127.0.0.1` | Keep on loopback — `tailscale serve` fronts it |
 | `CBT_UPSTREAM_PORT` | `8087` | Where `codexbar serve` listens |
 | `CBT_CACHE_TTL` | `60` | Snapshot cache seconds |
+| `CBT_COST_TTL` | `300` | Spend (`/api/cost`) cache seconds |
 | `CBT_UPSTREAM_TIMEOUT` | `90` | Upstream deadline; keep above `serve --request-timeout` |
 | `CBT_ACTIVE_WINDOW` | `600` | Keep the cache warm this long after the last client request |
 | `CBT_POLL` | `45` | Background refresh cadence while inside the active window |

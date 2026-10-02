@@ -5,6 +5,9 @@ const REFRESH_MS = 60_000;
 const VIEW_KEY = "codexbar.view";
 const LAST_KEY = "codexbar.last";
 const VERSION_KEY = "codexbar.version";
+const COST_KEY = "codexbar.cost";
+// Spend comes from a local log scan that moves slowly; the proxy caches it for 5 minutes.
+const COST_REFRESH_MS = 5 * 60_000;
 // How fresh the snapshot the server embedded in the page must be for the launch to skip
 // its opening fetch. Below this the proxy has demonstrably just checked upstream.
 const BOOT_FRESH_MS = 10_000;
@@ -36,10 +39,17 @@ let loading = false;
 let recheck = null;
 let updating = false;
 let shellStamp = null;
+let cost = null;
+let costLoading = false;
+let costFetchedAt = 0;
+let costError = null;
+let costRecheck = null;
+/** Spend view: provider id -> the YYYY-MM-DD day picked in its chart. */
+const spendSel = new Map();
 
 // Spin for the whole refresh cycle, not just the fetch: a warm proxy answers in
 // ~2 ms, so tying the spinner to the request alone makes it an invisible flash.
-const syncSpinner = () => el.refresh?.classList.toggle("spinning", loading || updating);
+const syncSpinner = () => el.refresh?.classList.toggle("spinning", loading || updating || costLoading);
 
 // The proxy answers stale hits instantly and refreshes in the background
 // (X-Snapshot-Refreshing). Re-poll on a short fuse until the fresh data lands.
@@ -93,8 +103,8 @@ function show(msg, isError) {
 }
 function hide() { el.status.hidden = true; }
 
-function readCached() {
-  try { return JSON.parse(localStorage.getItem(LAST_KEY)); } catch { return null; }
+function readCached(key = LAST_KEY) {
+  try { return JSON.parse(localStorage.getItem(key)); } catch { return null; }
 }
 
 /* ---------------- windows & countdowns ---------------- */
@@ -234,16 +244,179 @@ function renderDense(snap) {
   `;
 }
 
+/* ---------------- view: spend ---------------- */
+
+// `serve /cost`, trimmed by the proxy: per provider, local-log spend by calendar day with
+// its model split. Bars are days, so a provider is one series and its accent is identity.
+const SPEND_DAYS = 30;
+const MAX_MODELS = 5;
+
+const usd = new Intl.NumberFormat("en-US", { style: "currency", currency: "USD" });
+const usdWhole = new Intl.NumberFormat("en-US", { style: "currency", currency: "USD", maximumFractionDigits: 0 });
+
+function money(n) {
+  if (n == null) return "\u2014";
+  if (n > 0 && n < 0.005) return "<$0.01";
+  return (n >= 1000 ? usdWhole : usd).format(n);
+}
+
+const sum = (xs) => xs.reduce((a, b) => a + (b ?? 0), 0);
+
+// `/cost` buckets by the host's local calendar; the phone is assumed to share its zone.
+const dayKey = (d) =>
+  `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+
+function dayLabel(key, opts = { month: "short", day: "numeric" }) {
+  const [y, m, d] = key.split("-").map(Number);
+  return new Date(y, m - 1, d).toLocaleDateString(undefined, opts);
+}
+
+/** The last SPEND_DAYS local days, oldest first, keyed the way `/cost` keys them. */
+function spendDays() {
+  const now = new Date();
+  return Array.from({ length: SPEND_DAYS }, (_, i) =>
+    dayKey(new Date(now.getFullYear(), now.getMonth(), now.getDate() - (SPEND_DAYS - 1 - i))));
+}
+
+/** Cost per model across `days`, biggest first, with the tail folded into "Other". */
+function modelSplit(days) {
+  const by = new Map();
+  for (const d of days) {
+    for (const m of d.modelBreakdowns ?? []) by.set(m.modelName, (by.get(m.modelName) ?? 0) + (m.cost ?? 0));
+  }
+  const rows = [...by].map(([name, c]) => ({ name, cost: c })).filter((r) => r.cost > 0).sort((a, b) => b.cost - a.cost);
+  if (rows.length > MAX_MODELS) {
+    const rest = rows.splice(MAX_MODELS - 1);
+    rows.push({ name: "Other", cost: sum(rest.map((r) => r.cost)) });
+  }
+  return rows;
+}
+
+function spendCard(c, p, keys) {
+  const color = p?.display?.accentColor ?? "#8b8b96";
+  const byDay = new Map((c.daily ?? []).map((d) => [d.date, d]));
+  const series = keys.map((key) => ({ key, day: byDay.get(key) ?? null, cost: byDay.get(key)?.totalCost ?? 0 }));
+  const peak = series.reduce((a, b) => (b.cost > a.cost ? b : a), series[0]);
+  const sel = series.find((s) => s.key === spendSel.get(c.provider)) ?? null;
+  const total30 = c.last30DaysCostUSD ?? sum(series.map((s) => s.cost));
+  const today = c.sessionCostUSD ?? series[series.length - 1].cost;
+  const scopeDays = sel ? (sel.day ? [sel.day] : []) : series.map((s) => s.day).filter(Boolean);
+  const scopeTotal = sel ? sel.cost : total30;
+  const models = modelSplit(scopeDays);
+  const incomplete = c.incompleteRequestCount ?? c.totals?.incompleteRequestCount;
+  const periodTotal = c.totals?.totalCost;
+  const otherPeriod = c.reportingPeriod && c.reportingPeriod !== "rolling:30" && periodTotal != null;
+
+  const cols = series.map((s) => {
+    const h = peak.cost > 0 && s.cost > 0 ? Math.max(3, (s.cost / peak.cost) * 100) : 0;
+    const label = `${dayLabel(s.key)}: ${money(s.cost)}`;
+    return `<button class="col${sel?.key === s.key ? " on" : ""}" data-spend="${esc(c.provider)}" data-day="${s.key}"
+      aria-pressed="${sel?.key === s.key}" aria-label="${esc(label)}" title="${esc(label)}">${
+        h ? `<i style="height:${h.toFixed(1)}%;background:${esc(color)}"></i>` : ""}</button>`;
+  }).join("");
+
+  return `
+    <section class="card spend-card">
+      <header class="card-head">
+        ${pdot(p ?? {})}
+        <span class="card-name">${esc(p?.name ?? c.provider)}</span>
+        <span class="spend-total"><b>${esc(money(total30))}</b> 30d</span>
+      </header>
+
+      ${errText(c.error) ? `<div class="err">${esc(errText(c.error))}</div>` : ""}
+
+      ${peak.cost > 0 ? `
+        <div class="spend-chart">
+          <div class="spend-peak">Peak <b>${esc(money(peak.cost))}</b> \u00b7 ${esc(dayLabel(peak.key))}</div>
+          <div class="cols${sel ? " has-sel" : ""}" role="group" aria-label="Daily spend, last ${SPEND_DAYS} days">${cols}</div>
+          <div class="spend-axis"><span>${esc(dayLabel(keys[0]))}</span><span>Today</span></div>
+        </div>
+
+        <div class="spend-detail">
+          <div class="spend-detail-head">
+            <span>${sel ? esc(dayLabel(sel.key, { weekday: "short", month: "short", day: "numeric" })) : `Last ${SPEND_DAYS} days`}</span>
+            <b class="mono">${esc(money(scopeTotal))}</b>
+          </div>
+          ${models.map((m) => {
+            const share = scopeTotal > 0 ? Math.round((m.cost / scopeTotal) * 100) : 0;
+            return `
+              <div class="model">
+                <span class="model-name">${esc(m.name)}</span>
+                <span class="mono">${esc(money(m.cost))}</span>
+                <span class="model-share mono">${share}%</span>
+                <div class="bar model-bar"><i style="width:${Math.min(share, 100)}%;background:${esc(color)}"></i></div>
+              </div>
+            `;
+          }).join("")}
+          ${sel && models.length === 0 ? `<div class="win-label">No spend recorded.</div>` : ""}
+        </div>
+      ` : ""}
+
+      <footer class="card-foot">
+        <span>Today <b>${esc(money(today))}</b></span>
+        <span>Avg/day <b>${esc(money(total30 / SPEND_DAYS))}</b></span>
+        ${otherPeriod ? `<span>${esc(c.historyLabel ?? c.reportingPeriod)} <b>${esc(money(periodTotal))}</b></span>` : ""}
+        ${incomplete > 0 ? `<span class="tag" title="${incomplete} request(s) without final usage are excluded">Incomplete</span>` : ""}
+      </footer>
+    </section>
+  `;
+}
+
+function renderSpend(snap, data) {
+  if (!data) {
+    return `<p class="empty">${costError ? `Can't load spend (${esc(costError)}).` : "Loading spend\u2026"}</p>`;
+  }
+  const meta = new Map((snap?.providers ?? []).map((p) => [p.id, p]));
+  const rows = (data.providers ?? [])
+    .filter((c) => errText(c.error) || (c.daily ?? []).some((d) => d.totalCost > 0))
+    .sort((a, b) => (meta.get(a.provider)?.display?.sortKey ?? 999) - (meta.get(b.provider)?.display?.sortKey ?? 999));
+  if (rows.length === 0) return `<p class="empty">No local spend recorded in the last ${SPEND_DAYS} days.</p>`;
+
+  const keys = spendDays();
+  const estimate = rows.some((c) => c.provenance === "listPriceEstimate");
+  const stale = costError
+    ? `<div class="status">Couldn't refresh spend (${esc(costError)}) \u2014 showing the last copy.</div>`
+    : "";
+  return `
+    ${stale}
+    <section class="spend-hero">
+      <div>
+        <div class="hero-label">Today</div>
+        <div class="hero-value">${esc(money(sum(rows.map((c) => c.sessionCostUSD))))}</div>
+      </div>
+      <div class="hero-side">
+        <div class="hero-label">Last ${SPEND_DAYS} days</div>
+        <div class="hero-sub">${esc(money(sum(rows.map((c) => c.last30DaysCostUSD))))}</div>
+      </div>
+      ${estimate ? `<p class="hero-note">Estimated at API list prices from local logs \u2014 not what a subscription bills.</p>` : ""}
+    </section>
+    ${rows.map((c) => spendCard(c, meta.get(c.provider), keys)).join("")}
+  `;
+}
+
+el.content.addEventListener("click", (e) => {
+  const col = e.target.closest?.("[data-day]");
+  if (!col) return;
+  const { spend: id, day } = col.dataset;
+  if (spendSel.get(id) === day) spendSel.delete(id);
+  else spendSel.set(id, day);
+  render();
+  // Keyboard activation (detail 0): keep focus on the bar the markup was rebuilt under.
+  if (e.detail === 0) el.content.querySelector(`[data-spend="${CSS.escape(id)}"][data-day="${CSS.escape(day)}"]`)?.focus();
+});
+
 /* ---------------- core rendering ---------------- */
 
 function render() {
-  if (!snapshot) return;
-  if (view === "cards") el.content.innerHTML = renderCards(snapshot);
+  if (view === "spend") el.content.innerHTML = renderSpend(snapshot, cost);
+  else if (!snapshot) return;
+  else if (view === "cards") el.content.innerHTML = renderCards(snapshot);
   else if (view === "resets") el.content.innerHTML = renderResets(snapshot);
   else if (view === "dense") el.content.innerHTML = renderDense(snapshot);
 
-  if (snapshot.generatedAt) {
-    const when = new Date(snapshot.generatedAt).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+  const stamp = view === "spend" ? cost?.generatedAt : snapshot?.generatedAt;
+  if (stamp) {
+    const when = new Date(stamp).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
     el.meta.textContent = `Updated ${when}`;
   }
 }
@@ -279,6 +452,38 @@ async function load() {
     syncSpinner();
     el.content.setAttribute("aria-busy", "false");
   }
+}
+
+async function loadCost() {
+  if (costLoading) return;
+  costLoading = true;
+  syncSpinner();
+  try {
+    const res = await fetch("/api/cost", { cache: "no-store" });
+    if (!res.ok) throw new Error(`cost ${res.status}`);
+    cost = await res.json();
+    costFetchedAt = Date.now();
+    costError = null;
+    localStorage.setItem(COST_KEY, JSON.stringify(cost));
+    if (res.headers.get("X-Snapshot-Refreshing") === "true" && !costRecheck) {
+      costRecheck = setTimeout(() => {
+        costRecheck = null;
+        loadCost();
+      }, 4000);
+    }
+  } catch (err) {
+    costError = err.message;
+    cost ??= readCached(COST_KEY);
+  } finally {
+    costLoading = false;
+    syncSpinner();
+    if (view === "spend") render();
+  }
+}
+
+/** Spend is only fetched while someone is looking at it, and at most every few minutes. */
+function maybeLoadCost() {
+  if (view === "spend" && Date.now() - costFetchedAt > COST_REFRESH_MS) loadCost();
 }
 
 /** Footer credit: repo link plus the commit this build was served from. */
@@ -323,15 +528,20 @@ function setView(next) {
     b.setAttribute("aria-selected", String(b.dataset.view === next));
   }
   render();
+  maybeLoadCost();
 }
 
 for (const b of document.querySelectorAll(".view-btn")) {
   b.addEventListener("click", () => setView(b.dataset.view));
 }
-el.refresh?.addEventListener("click", () => load());
+el.refresh?.addEventListener("click", () => {
+  load();
+  if (view === "spend") loadCost();
+});
 document.addEventListener("visibilitychange", () => {
   if (document.hidden) return;
   load();
+  maybeLoadCost();
   loadVersion();
 });
 
@@ -549,6 +759,7 @@ function generatedMs(s) {
 }
 
 snapshot = newerOf(boot?.snapshot ?? null, readCached());
+cost = readCached(COST_KEY);
 if (snapshot) localStorage.setItem(LAST_KEY, JSON.stringify(snapshot));
 renderAbout(knownVersion());
 setView(view);
@@ -559,8 +770,11 @@ const bootIsCurrent = snapshot === boot?.snapshot
 if (!bootIsCurrent) load();
 
 setTimeout(loadVersion, 2000);
-setInterval(load, REFRESH_MS);
-ticking = setInterval(() => { if (snapshot) render(); }, 30_000);
+setInterval(() => {
+  load();
+  maybeLoadCost();
+}, REFRESH_MS);
+ticking = setInterval(render, 30_000);
 
 if ("serviceWorker" in navigator) {
   const hadController = !!navigator.serviceWorker.controller;
