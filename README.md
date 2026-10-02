@@ -15,12 +15,14 @@ Android/iOS PWA ──https──▶ tailscale serve ──▶ node :8899 (loopb
                                                  │                      + Authorization: Bearer …
                                                  │                                       codexbar serve
                                                  ├── /api/cost     ──▶ 127.0.0.1:8087/cost (trimmed)
+                                                 ├── /api/pace     usage history per window → pace
                                                  └── /api/push/*   Web Push notifications
 ```
 
 Four views, remembered across launches:
 
-- **Cards** — provider tiles with per-window usage bars, plan badges, credits and cost.
+- **Cards** — provider tiles with per-window usage bars, plan badges, credits and cost, and for
+  windows in use a burndown sparkline and a pace line (see below).
 - **Resets** — every window across every provider, soonest reset first, with large countdowns.
 - **Dense** — one compact row per window.
 - **Spend** — today's and 30-day spend, then per provider a 30-day daily chart and the cost split
@@ -66,6 +68,28 @@ OpenCode Go windows, weekly resets).
 - **Device UI**: Tap the bell icon in the topbar to enable/disable notifications or send a test push.
 - **iOS Note**: On iOS 16.4+, Apple requires Web Push apps to be added to the Home Screen first before
   requesting notification permissions.
+
+## Pace and burndown
+
+dashboard-v1 carries no history and no window lengths, so the proxy keeps its own: every
+snapshot it fetches appends one reading per window to `usage-history.json` (flat stretches
+collapse to their two ends; a renewal starts a new series). Window lengths come from
+`serve /usage`, which has `windowMinutes` but is a full provider fetch, so it is asked only when
+a window appears that it never asked about, and otherwise once a day. `/api/pace` reports, per
+window:
+
+- **Pace against even use** — expected usage if the window were spent evenly from its start to
+  its reset, and the gap: `12% in reserve`, `On pace` (within 5 points), `20% in deficit`. The same
+  comparison upstream's own pace makes.
+- **Projection from the recent burn** — the rate over the last fifth of the window (30 min to a
+  day), so a burst shows up while it still matters: `lasts to reset`, or `⚠ Runs out in 1d 7h`
+  when it would empty the window first. Resets shows the warning too.
+- **Burndown sparkline** — the recorded reserve over the cycle against the dashed even-use line,
+  ending at the last reading rather than drawn on to now.
+
+Readings only accrue while something fetches snapshots, so the proxy also refreshes on its own
+every `CBT_HISTORY_POLL` seconds (15 min) with no client around. A projection needs at least
+15 minutes of history in the cycle; until then only the even-use comparison shows.
 
 ## Why a proxy instead of pointing the phone at `codexbar serve`
 
@@ -140,6 +164,8 @@ Read from `~/.config/codexbar/dashboard.env` (mode 600):
 | `CBT_UPSTREAM_PORT` | `8087` | Where `codexbar serve` listens |
 | `CBT_CACHE_TTL` | `60` | Snapshot cache seconds |
 | `CBT_COST_TTL` | `300` | Spend (`/api/cost`) cache seconds |
+| `CBT_HISTORY_POLL` | `900` | Refresh this often with no client around, so pace has readings; `0` records only client-driven fetches |
+| `CBT_HISTORY_PATH` | `~/.config/codexbar/usage-history.json` | Usage readings per window and the learned window lengths |
 | `CBT_UPSTREAM_TIMEOUT` | `90` | Upstream deadline; keep above `serve --request-timeout` |
 | `CBT_ACTIVE_WINDOW` | `600` | Keep the cache warm this long after the last client request |
 | `CBT_POLL` | `45` | Background refresh cadence while inside the active window |

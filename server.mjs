@@ -27,6 +27,7 @@ import {
   DEFAULT_MIN_USED_PERCENT,
   DEFAULT_PUSH_TTL_SECONDS,
 } from "./push.mjs";
+import { UsageHistory } from "./history.mjs";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const PUBLIC_DIR = path.join(HERE, "public");
@@ -56,6 +57,7 @@ const CONFIG_DIR = process.env.CBT_CONFIG_DIR ??
 const VAPID_PATH = process.env.CBT_VAPID_PATH ?? path.join(CONFIG_DIR, "vapid.json");
 const SUBSCRIPTIONS_PATH = process.env.CBT_PUSH_SUBSCRIPTIONS_PATH ?? path.join(CONFIG_DIR, "push-subscriptions.json");
 const WINDOW_STATE_PATH = process.env.CBT_PUSH_STATE_PATH ?? path.join(CONFIG_DIR, "push-window-state.json");
+const HISTORY_PATH = process.env.CBT_HISTORY_PATH ?? path.join(CONFIG_DIR, "usage-history.json");
 const VAPID_SUBJECT = process.env.CBT_VAPID_SUBJECT ?? "mailto:codexbar@local";
 // A numeric env knob, or its default when unset, blank or out of range. `Number()` alone
 // turns "abc" into NaN and "" into 0, and either silently breaks renewal detection.
@@ -76,6 +78,9 @@ const PUSH_MIN_USED_PERCENT = envNumber("CBT_PUSH_MIN_USED", DEFAULT_MIN_USED_PE
 const PUSH_TTL_SECONDS = envNumber("CBT_PUSH_TTL", DEFAULT_PUSH_TTL_SECONDS, { min: 0, integer: true });
 // Consecutive VAPID rejections before a subscription is treated as dead.
 const PUSH_AUTH_FAILURE_LIMIT = 3;
+// Pace needs readings while nobody is looking too, or a quiet morning is one straight line
+// between two app launches. 0 turns this off and records only what clients cause.
+const HISTORY_POLL_MS = envNumber("CBT_HISTORY_POLL", 900, { min: 0 }) * 1000;
 
 if (!TOKEN) {
   console.error("CODEXBAR_DASHBOARD_TOKEN is not set — the snapshot route would 401. Refusing to start.");
@@ -98,12 +103,18 @@ if (windowStates.size > 0) console.log(`push: restored usage state for ${windowS
 // Last state written, so a poll that changed nothing does not rewrite the file.
 let savedWindowStates = JSON.stringify(Object.fromEntries(windowStates));
 
+// Usage samples per window, for pace and the burndown sparklines.
+const history = new UsageHistory(HISTORY_PATH);
+await history.load();
+if (history.series.size > 0) console.log(`history: restored ${history.series.size} window series`);
+
 // Re-stamp the state on the way down: the file is only rewritten when usage changes, so
 // without this its age after a restart would be how long usage sat still, and a quiet
 // afternoon would get it discarded as stale.
 for (const signal of ["SIGTERM", "SIGINT"]) {
   process.once(signal, () => {
-    saveWindowStates(WINDOW_STATE_PATH, windowStates).finally(() => process.exit(0));
+    Promise.allSettled([saveWindowStates(WINDOW_STATE_PATH, windowStates), history.save()])
+      .finally(() => process.exit(0));
   });
 }
 let resetTimer = null;
@@ -329,6 +340,8 @@ let cache = null;
 let lastGood = null;
 /** @type {Promise<{body: string, at: number}> | null} */
 let inFlight = null;
+/** The newest snapshot, parsed: what pace is reported against. */
+let latestSnapshot = null;
 
 function fetchUpstream(upstreamPath) {
   return new Promise((resolve, reject) => {
@@ -376,7 +389,10 @@ function refresh() {
         lastGood = fresh;
         try {
           const parsed = JSON.parse(fresh.body);
+          latestSnapshot = parsed;
           handleSnapshotRenewals(parsed).catch(() => {});
+          history.record(parsed, fresh.at);
+          learnDurations(parsed);
         } catch { /* json parse error */ }
         return fresh;
       })
@@ -424,6 +440,40 @@ setInterval(() => {
 
 // Prewarm at boot so even the first-ever request finds a cache.
 refresh().catch(() => {});
+
+/* ---------------- usage history & pace ---------------- */
+
+// Window lengths are only in `serve /usage`, which is a full provider fetch of its own, so it
+// is asked when a window shows up that was never asked about, and otherwise once a day.
+let durationsInFlight = false;
+let durationsTriedAt = 0;
+function learnDurations(snap) {
+  if (durationsInFlight || Date.now() - durationsTriedAt < 10 * 60_000) return;
+  if (!history.needsDurations(snap)) return;
+  durationsInFlight = true;
+  durationsTriedAt = Date.now();
+  fetchUpstream("/usage")
+    .then((res) => {
+      history.learnDurations(JSON.parse(res.body), snap);
+      console.log(`history: learned ${history.durations.size} window length(s) from /usage`);
+    })
+    .catch((err) => console.warn(`history: /usage failed: ${err.message}`))
+    .finally(() => { durationsInFlight = false; });
+}
+
+if (HISTORY_POLL_MS > 0) {
+  setInterval(() => {
+    if (cache && Date.now() - cache.at < HISTORY_POLL_MS) return; // clients kept it fresh
+    refresh().catch(() => {});
+  }, HISTORY_POLL_MS).unref?.();
+}
+setInterval(() => history.save().catch((err) => console.warn(`history: save failed: ${err.message}`)), 5 * 60_000).unref?.();
+
+/** Pace per window of the newest snapshot, as JSON. */
+function paceBody() {
+  const snap = latestSnapshot ?? (lastGood ? JSON.parse(lastGood.body) : null);
+  return JSON.stringify({ generatedAt: new Date().toISOString(), windows: snap ? history.report(snap) : {} });
+}
 
 /* ---------------- spend history (`serve /cost`) ---------------- */
 
@@ -519,6 +569,7 @@ function bootScript(snap, ver, vapidPub) {
   const fields = [
     `"version":${JSON.stringify(ver)}`,
     `"vapidPublicKey":${JSON.stringify(vapidPub ?? null)}`,
+    `"pace":${paceBody()}`,
   ];
   if (snap) {
     fields.push(
@@ -724,6 +775,14 @@ const server = http.createServer(async (req, res) => {
       res.writeHead(502, { "Content-Type": "application/json", "Cache-Control": "no-store" });
       res.end(JSON.stringify({ error: "upstream_unavailable", detail: String(err.message) }));
     }
+    return;
+  }
+
+  if (urlPath === "/api/pace") {
+    const json = "application/json; charset=utf-8";
+    const body = paceBody();
+    sendBody(req, res, 200, { "Content-Type": json, "Cache-Control": "no-store" }, body,
+      shouldGzip(req, json, Buffer.byteLength(body)));
     return;
   }
 

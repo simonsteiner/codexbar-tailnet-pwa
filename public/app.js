@@ -40,6 +40,8 @@ let recheck = null;
 let updating = false;
 let shellStamp = null;
 let cost = null;
+/** Per-window pace from the proxy's usage history (`/api/pace`), keyed `provider::kind`. */
+let pace = boot?.pace ?? null;
 let costLoading = false;
 let costFetchedAt = 0;
 let costError = null;
@@ -112,16 +114,81 @@ function readCached(key = LAST_KEY) {
 // Drop windows the user configured the upstream menu bar to hide.
 const shown = (p) => (p.windows ?? []).filter((w) => !w.idle);
 
-function countdown(iso) {
-  if (!iso) return null;
-  const ms = new Date(iso).getTime() - Date.now();
-  if (ms <= 0) return "now";
+/** A duration as "2d 4h", "3h 20m" or "5m". */
+function span(ms) {
   const m = Math.floor(ms / 60_000);
   const h = Math.floor(m / 60);
   const d = Math.floor(h / 24);
   if (d > 0) return `${d}d ${h % 24}h`;
   if (h > 0) return `${h}h ${m % 60}m`;
   return `${Math.max(1, m)}m`;
+}
+
+function countdown(iso) {
+  if (!iso) return null;
+  const ms = new Date(iso).getTime() - Date.now();
+  return ms <= 0 ? "now" : span(ms);
+}
+
+/* ---------------- pace ---------------- */
+
+const paceOf = (p, w) => pace?.windows?.[`${p.id}::${w.kind}`] ?? null;
+
+/** Time until the projected run-out, measured from now rather than from the last sample. */
+function etaLeft(pc) {
+  const last = pc.samples?.[pc.samples.length - 1]?.[0] ?? Date.now();
+  return pc.etaSeconds * 1000 - (Date.now() - last);
+}
+
+/** "Runs out in 1h 20m" when the recent burn empties the window before it resets, else null. */
+function runOut(pc) {
+  if (pc?.willLastToReset !== false) return null;
+  const left = pc.etaSeconds > 0 ? etaLeft(pc) : 0;
+  return left > 0 ? `Runs out in ${span(left)}` : "Used up";
+}
+
+/** Under a window's bar: how usage compares with even use, then where the recent burn leads. */
+function paceLine(pc) {
+  // An untouched window is trivially in reserve; saying so on every idle lane is noise.
+  if (!(pc?.usedPercent > 0)) return "";
+  const parts = [];
+  if (pc.stage === "onPace") parts.push("On pace");
+  else if (pc.stage) parts.push(`${Math.abs(pc.deltaPercent)}% in ${pc.stage}`);
+  const out = runOut(pc);
+  if (pc.willLastToReset === true && pc.usedPercent > 0) parts.push("lasts to reset");
+  if (!parts.length && !out) return "";
+  const why = [
+    pc.expectedUsedPercent != null ? `Expected ${pc.expectedUsedPercent}% used by now` : null,
+    pc.ratePerHour != null ? `burning ${pc.ratePerHour}%/h over the last ${span(pc.lookbackMinutes * 60_000)}` : null,
+  ].filter(Boolean).join(" \u00b7 ");
+  return `<div class="pace" title="${esc(why)}">${esc(parts.join(" \u00b7 "))}${
+    out ? `${parts.length ? " \u00b7 " : ""}<span class="t-warn">\u26a0 ${esc(out)}</span>` : ""}</div>`;
+}
+
+/**
+ * Burndown sparkline: recorded reserve over the cycle, against the even-use line from full at
+ * the window's start to empty at its reset. Like upstream's chart, it stops at the last
+ * reading rather than being drawn on to now. Omitted until usage has actually moved.
+ */
+function sparkline(pc, sev) {
+  const pts = pc?.samples ?? [];
+  if (pts.length < 2) return "";
+  const used = pts.map((s) => s[1]);
+  if (Math.max(...used) - Math.min(...used) < 1) return "";
+  const x0 = pc.startAt ? Date.parse(pc.startAt) : pts[0][0];
+  const x1 = Date.parse(pc.resetAt);
+  if (!(x1 > x0)) return "";
+  const x = (t) => Math.min(100, Math.max(0, ((t - x0) / (x1 - x0)) * 100)).toFixed(2);
+  const line = pts.map(([t, u]) => `${x(t)},${(u * 0.24).toFixed(2)}`).join(" ");
+  // The wash under the line is the reserve itself, so the chart drains like the bars do.
+  const area = `${x(pts[0][0])},24 ${line} ${x(pts[pts.length - 1][0])},24`;
+  return `
+    <svg class="spark" viewBox="0 0 100 24" preserveAspectRatio="none" aria-hidden="true">
+      <polygon class="spark-area t-${sev}" points="${area}"/>
+      ${pc.startAt ? `<line class="spark-guide" x1="0" y1="0" x2="100" y2="24" vector-effect="non-scaling-stroke"/>` : ""}
+      <polyline class="spark-line stroke-${sev}" points="${line}" vector-effect="non-scaling-stroke"/>
+    </svg>
+  `;
 }
 
 /** Flatten all shown windows across enabled providers for the Resets view. */
@@ -162,6 +229,7 @@ function renderCards(snap) {
           const res = reserve(w);
           const sev = severity(w.usedPercent);
           const cd = countdown(w.resetAt);
+          const pc = paceOf(p, w);
           return `
             <div class="win">
               <div class="win-top">
@@ -174,6 +242,8 @@ function renderCards(snap) {
               <div class="bar">
                 <i class="fill-${sev}" style="width:${barWidth(w)}%"></i>
               </div>
+              ${sparkline(pc, sev)}
+              ${paceLine(pc)}
             </div>
           `;
         }).join("")}
@@ -205,11 +275,13 @@ function renderResets(snap) {
     const res = reserve(win);
     const sev = severity(win.usedPercent);
     const who = acc ? `${esc(p.name)} <span class="reset-sub">(${esc(acc.label ?? acc.id)})</span>` : esc(p.name);
+    const out = acc ? null : runOut(paceOf(p, win));
     return `
       <section class="reset-row">
         <span class="reset-when mono">${esc(countdown(win.resetAt))}</span>
         <div class="reset-who">${pdot(p)} <span>${who}</span></div>
-        <div class="reset-sub">${esc(win.label ?? win.kind)} \u00b7 <b class="t-${sev} mono">${res}%</b></div>
+        <div class="reset-sub">${esc(win.label ?? win.kind)} \u00b7 <b class="t-${sev} mono">${res}%</b>${
+          out ? ` \u00b7 <span class="t-warn">\u26a0 ${esc(out)}</span>` : ""}</div>
         <div class="bar reset-bar">
           <i class="fill-${sev}" style="width:${barWidth(win)}%"></i>
         </div>
@@ -427,10 +499,15 @@ async function load() {
   syncSpinner();
   el.content.setAttribute("aria-busy", "true");
 
+  // Pace is derived from the same proxy-side snapshot, so ask for both at once and render once.
+  const paceReq = fetch("/api/pace", { cache: "no-store" })
+    .then((r) => (r.ok ? r.json() : null))
+    .catch(() => null);
   try {
     const res = await fetch("/api/snapshot", { cache: "no-store" });
     if (!res.ok) throw new Error(`snapshot ${res.status}`);
     snapshot = await res.json();
+    pace = (await paceReq) ?? pace;
     localStorage.setItem(LAST_KEY, JSON.stringify(snapshot));
     updating = res.headers.get("X-Snapshot-Refreshing") === "true";
     if (updating) scheduleRecheck();
