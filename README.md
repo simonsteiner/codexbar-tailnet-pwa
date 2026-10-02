@@ -91,6 +91,14 @@ Readings only accrue while something fetches snapshots, so the proxy also refres
 every `CBT_HISTORY_POLL` seconds (15 min) with no client around. A projection needs at least
 15 minutes of history in the cycle; until then only the even-use comparison shows.
 
+## Stale data
+
+A provider row whose `updatedAt` is older than the snapshot's `staleAfterSeconds` (180 s) gets an
+amber `5h 30m old` badge (a ⚠ in Dense), and the footer turns amber with the snapshot's age. A
+hung provider probe under `serve` can otherwise freeze every row behind plausible numbers. After
+an idle spell the badges also show briefly while the first refresh is still in flight, because
+that data really is old.
+
 ## Why a proxy instead of pointing the phone at `codexbar serve`
 
 Three concrete blockers, all handled here:

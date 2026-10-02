@@ -321,3 +321,4 @@ body {
 .spark-guide { stroke: var(--muted); stroke-opacity: 0.6; stroke-width: 1; stroke-dasharray: 3 3; }
 .spark-line { fill: none; stroke-width: 1.5; stroke-linejoin: round; stroke-linecap: round; }
 .stroke-ok { stroke: var(--ok); } .stroke-warn { stroke: var(--warn); } .stroke-crit { stroke: var(--crit); }
+.card-head .tag { white-space: nowrap; }

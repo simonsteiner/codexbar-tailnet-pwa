@@ -130,6 +130,34 @@ function countdown(iso) {
   return ms <= 0 ? "now" : span(ms);
 }
 
+/* ---------------- staleness ---------------- */
+
+// A row older than the snapshot's own staleness hint is old data, not slow data: a hung
+// provider probe under `serve` can freeze every row behind perfectly plausible numbers.
+function staleAge(iso) {
+  const t = Date.parse(iso ?? "");
+  if (!Number.isFinite(t)) return null;
+  const age = Date.now() - t;
+  return age > (snapshot?.staleAfterSeconds ?? 180) * 1000 ? age : null;
+}
+
+function staleTag(p) {
+  const age = staleAge(p.updatedAt);
+  if (!age) return "";
+  const at = new Date(p.updatedAt).toLocaleString([], { weekday: "short", hour: "2-digit", minute: "2-digit" });
+  return `<span class="tag" title="Last updated ${esc(at)}">${esc(span(age))} old</span>`;
+}
+
+/** The same warning inline, for the rows of Resets; `compact` is a bare mark for Dense. */
+function staleNote(p, compact = false) {
+  const age = staleAge(p.updatedAt);
+  if (!age) return "";
+  const text = `${span(age)} old`;
+  return compact
+    ? ` <span class="t-warn" title="${esc(text)}" aria-label="${esc(text)}">\u26a0</span>`
+    : ` \u00b7 <span class="t-warn">${esc(text)}</span>`;
+}
+
 /* ---------------- pace ---------------- */
 
 const paceOf = (p, w) => pace?.windows?.[`${p.id}::${w.kind}`] ?? null;
@@ -220,6 +248,7 @@ function renderCards(snap) {
         <header class="card-head">
           ${pdot(p)}
           <span class="card-name">${esc(p.name)}</span>
+          ${staleTag(p)}
           ${p.identity?.plan ? `<span class="badge">${esc(p.identity.plan)}</span>` : ""}
         </header>
 
@@ -281,7 +310,7 @@ function renderResets(snap) {
         <span class="reset-when mono">${esc(countdown(win.resetAt))}</span>
         <div class="reset-who">${pdot(p)} <span>${who}</span></div>
         <div class="reset-sub">${esc(win.label ?? win.kind)} \u00b7 <b class="t-${sev} mono">${res}%</b>${
-          out ? ` \u00b7 <span class="t-warn">\u26a0 ${esc(out)}</span>` : ""}</div>
+          out ? ` \u00b7 <span class="t-warn">\u26a0 ${esc(out)}</span>` : ""}${staleNote(p)}</div>
         <div class="bar reset-bar">
           <i class="fill-${sev}" style="width:${barWidth(win)}%"></i>
         </div>
@@ -306,7 +335,7 @@ function renderDense(snap) {
         return `
           <div class="drow">
             ${pdot(p)}
-            <span class="dname">${esc(name)} <span class="dwin">\u00b7 ${esc(win.label ?? win.kind)}</span></span>
+            <span class="dname">${esc(name)}${staleNote(p, true)} <span class="dwin">\u00b7 ${esc(win.label ?? win.kind)}</span></span>
             <span class="dpct mono t-${sev}">${res}<span class="dsuf">%</span></span>
             <span class="dreset mono">${cd ? esc(cd) : "\u2014"}</span>
           </div>
@@ -489,7 +518,9 @@ function render() {
   const stamp = view === "spend" ? cost?.generatedAt : snapshot?.generatedAt;
   if (stamp) {
     const when = new Date(stamp).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
-    el.meta.textContent = `Updated ${when}`;
+    const age = view === "spend" ? null : staleAge(stamp);
+    el.meta.textContent = age ? `Updated ${when} \u00b7 ${span(age)} ago` : `Updated ${when}`;
+    el.meta.classList.toggle("t-warn", !!age);
   }
 }
 
