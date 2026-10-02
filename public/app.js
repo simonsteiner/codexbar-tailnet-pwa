@@ -64,8 +64,10 @@ const reserve = (w) => Math.max(0, Math.round(w.remainingPercent ?? 100 - w.used
 // Matches the Android client's gauge; the severity color still keys off how much is *used*.
 const barWidth = (w) => Math.min(reserve(w), 100);
 
-/** Remaining credit balance for a provider, or null if it doesn't report one. */
-const credits = (p) => (typeof p.credits?.remainingUSD === "number" ? p.credits.remainingUSD : null);
+/** Remaining credit balance as dashboard-v1 reports it (`{remaining, unit}`), or null. */
+const credits = (p) => (typeof p.credits?.remaining === "number" ? p.credits : null);
+
+const fmtNum = (n) => n.toLocaleString(undefined, { maximumFractionDigits: 2 });
 
 // Upstream reports provider errors as {code, message, kind}; older payloads used a bare string.
 const errText = (e) => (e == null ? null : typeof e === "string" ? e : (e.message ?? null));
@@ -170,7 +172,7 @@ function renderCards(snap) {
           <footer class="card-foot">
             ${p.cost?.todayUSD != null ? `<span>Today <b>$${p.cost.todayUSD.toFixed(2)}</b></span>` : ""}
             ${p.cost?.last30DaysUSD != null ? `<span>30d <b>$${p.cost.last30DaysUSD.toFixed(2)}</b></span>` : ""}
-            ${cred != null ? `<span>Credit <b>$${cred.toFixed(2)}</b></span>` : ""}
+            ${cred ? `<span><b>${fmtNum(cred.remaining)}</b> ${esc(cred.unit ?? "credits")} left</span>` : ""}
           </footer>
         ` : ""}
       </section>
