@@ -295,6 +295,7 @@ body {
 .spend-axis { display: flex; justify-content: space-between; color: var(--muted); font-size: 11px; }
 
 .spend-detail { display: grid; gap: 7px; }
+.spend-none { color: var(--muted); font-size: 12.5px; }
 .spend-detail-head { display: flex; justify-content: space-between; font-size: 13px; font-weight: 600; }
 .model {
   display: grid; grid-template-columns: 1fr auto 38px; gap: 3px 10px;
@@ -322,3 +323,15 @@ body {
 .spark-line { fill: none; stroke-width: 1.5; stroke-linejoin: round; stroke-linecap: round; }
 .stroke-ok { stroke: var(--ok); } .stroke-warn { stroke: var(--warn); } .stroke-crit { stroke: var(--crit); }
 .card-head .tag { white-space: nowrap; }
+
+.seg {
+  display: flex; gap: 4px; padding: 4px;
+  background: var(--surface); border: 1px solid var(--line); border-radius: 11px;
+}
+.seg-btn {
+  flex: 1; padding: 7px 0; border: 0; border-radius: 8px;
+  background: transparent; color: var(--muted);
+  font: inherit; font-size: 13px; font-weight: 550; white-space: nowrap;
+  cursor: pointer; -webkit-tap-highlight-color: transparent;
+}
+.seg-btn[aria-selected="true"] { background: var(--surface-2); color: var(--text); }

@@ -46,7 +46,7 @@ let costLoading = false;
 let costFetchedAt = 0;
 let costError = null;
 let costRecheck = null;
-/** Spend view: provider id -> the YYYY-MM-DD day picked in its chart. */
+/** Spend view: provider id -> the column (its first YYYY-MM-DD day) picked in its chart. */
 const spendSel = new Map();
 
 // Spin for the whole refresh cycle, not just the fetch: a warm proxy answers in
@@ -347,23 +347,33 @@ function renderDense(snap) {
 
 /* ---------------- view: spend ---------------- */
 
-// `serve /cost`, trimmed by the proxy: per provider, local-log spend by calendar day with
-// its model split. Bars are days, so a provider is one series and its accent is identity.
-const SPEND_DAYS = 30;
+// `codexbar cost --days 90`, trimmed by the proxy: per provider, local-log spend by calendar
+// day with its model split. Each range is sliced out of that one payload on the phone. Bars
+// are days (weeks for 90 days, where daily columns would be under 2 px wide on a phone), so a
+// provider is one series and its accent is identity.
+const RANGE_KEY = "codexbar.spendRange";
+const SPEND_RANGES = {
+  today: { label: "Today", short: "today", days: 1, bucket: 1 },
+  "7d": { label: "7 days", short: "7d", days: 7, bucket: 1 },
+  "30d": { label: "30 days", short: "30d", days: 30, bucket: 1 },
+  "90d": { label: "90 days", short: "90d", days: 90, bucket: 7 },
+};
 const MAX_MODELS = 5;
+
+let spendRange = SPEND_RANGES[localStorage.getItem(RANGE_KEY)] ? localStorage.getItem(RANGE_KEY) : "30d";
 
 const usd = new Intl.NumberFormat("en-US", { style: "currency", currency: "USD" });
 const usdWhole = new Intl.NumberFormat("en-US", { style: "currency", currency: "USD", maximumFractionDigits: 0 });
 
 function money(n) {
-  if (n == null) return "\u2014";
+  if (n == null) return "—";
   if (n > 0 && n < 0.005) return "<$0.01";
   return (n >= 1000 ? usdWhole : usd).format(n);
 }
 
 const sum = (xs) => xs.reduce((a, b) => a + (b ?? 0), 0);
 
-// `/cost` buckets by the host's local calendar; the phone is assumed to share its zone.
+// The cost report buckets by the host's local calendar; the phone is assumed to share its zone.
 const dayKey = (d) =>
   `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
 
@@ -372,11 +382,23 @@ function dayLabel(key, opts = { month: "short", day: "numeric" }) {
   return new Date(y, m - 1, d).toLocaleDateString(undefined, opts);
 }
 
-/** The last SPEND_DAYS local days, oldest first, keyed the way `/cost` keys them. */
-function spendDays() {
+/** The last `n` local days, oldest first, keyed the way the cost report keys them. */
+function lastDays(n) {
   const now = new Date();
-  return Array.from({ length: SPEND_DAYS }, (_, i) =>
-    dayKey(new Date(now.getFullYear(), now.getMonth(), now.getDate() - (SPEND_DAYS - 1 - i))));
+  return Array.from({ length: n }, (_, i) =>
+    dayKey(new Date(now.getFullYear(), now.getMonth(), now.getDate() - (n - 1 - i))));
+}
+
+/** The range's columns, oldest first. Weekly buckets count back from today, so only the oldest can be short. */
+function spendBuckets(range) {
+  const days = lastDays(range.days);
+  const groups = [];
+  for (let end = days.length; end > 0; end -= range.bucket) groups.unshift(days.slice(Math.max(0, end - range.bucket), end));
+  return groups.map((ds) => ({ key: ds[0], days: ds }));
+}
+
+function bucketLabel(b, opts) {
+  return b.days.length === 1 ? dayLabel(b.key, opts) : `${dayLabel(b.days[0])} – ${dayLabel(b.days[b.days.length - 1])}`;
 }
 
 /** Cost per model across `days`, biggest first, with the tail folded into "Other". */
@@ -393,24 +415,31 @@ function modelSplit(days) {
   return rows;
 }
 
-function spendCard(c, p, keys) {
-  const color = p?.display?.accentColor ?? "#8b8b96";
+/** One provider's spend over the range: its columns, and the day entries behind them. */
+function spendSeries(c, buckets) {
   const byDay = new Map((c.daily ?? []).map((d) => [d.date, d]));
-  const series = keys.map((key) => ({ key, day: byDay.get(key) ?? null, cost: byDay.get(key)?.totalCost ?? 0 }));
+  const series = buckets.map((b) => {
+    const entries = b.days.map((k) => byDay.get(k)).filter(Boolean);
+    return { ...b, entries, cost: sum(entries.map((d) => d.totalCost)) };
+  });
+  return { series, total: sum(series.map((s) => s.cost)) };
+}
+
+function spendCard(c, p, range, buckets) {
+  const color = p?.display?.accentColor ?? "#8b8b96";
+  const { series, total } = spendSeries(c, buckets);
   const peak = series.reduce((a, b) => (b.cost > a.cost ? b : a), series[0]);
   const sel = series.find((s) => s.key === spendSel.get(c.provider)) ?? null;
-  const total30 = c.last30DaysCostUSD ?? sum(series.map((s) => s.cost));
-  const today = c.sessionCostUSD ?? series[series.length - 1].cost;
-  const scopeDays = sel ? (sel.day ? [sel.day] : []) : series.map((s) => s.day).filter(Boolean);
-  const scopeTotal = sel ? sel.cost : total30;
-  const models = modelSplit(scopeDays);
-  const incomplete = c.incompleteRequestCount ?? c.totals?.incompleteRequestCount;
-  const periodTotal = c.totals?.totalCost;
-  const otherPeriod = c.reportingPeriod && c.reportingPeriod !== "rolling:30" && periodTotal != null;
+  const scope = sel ?? { entries: series.flatMap((s) => s.entries), cost: total };
+  const models = modelSplit(scope.entries);
+  const today = (c.daily ?? []).find((d) => d.date === dayKey(new Date()))?.totalCost ?? 0;
+  const incomplete = sum(series.flatMap((s) => s.entries.map((d) => d.incompleteRequestCount)));
+  const unit = range.bucket === 1 ? "Daily" : "Weekly";
+  const showChart = range.days > 1 && peak.cost > 0;
 
   const cols = series.map((s) => {
     const h = peak.cost > 0 && s.cost > 0 ? Math.max(3, (s.cost / peak.cost) * 100) : 0;
-    const label = `${dayLabel(s.key)}: ${money(s.cost)}`;
+    const label = `${bucketLabel(s)}: ${money(s.cost)}`;
     return `<button class="col${sel?.key === s.key ? " on" : ""}" data-spend="${esc(c.provider)}" data-day="${s.key}"
       aria-pressed="${sel?.key === s.key}" aria-label="${esc(label)}" title="${esc(label)}">${
         h ? `<i style="height:${h.toFixed(1)}%;background:${esc(color)}"></i>` : ""}</button>`;
@@ -421,25 +450,28 @@ function spendCard(c, p, keys) {
       <header class="card-head">
         ${pdot(p ?? {})}
         <span class="card-name">${esc(p?.name ?? c.provider)}</span>
-        <span class="spend-total"><b>${esc(money(total30))}</b> 30d</span>
+        <span class="spend-total"><b>${esc(money(total))}</b> ${esc(range.short)}</span>
       </header>
 
       ${errText(c.error) ? `<div class="err">${esc(errText(c.error))}</div>` : ""}
 
-      ${peak.cost > 0 ? `
+      ${showChart ? `
         <div class="spend-chart">
-          <div class="spend-peak">Peak <b>${esc(money(peak.cost))}</b> \u00b7 ${esc(dayLabel(peak.key))}</div>
-          <div class="cols${sel ? " has-sel" : ""}" role="group" aria-label="Daily spend, last ${SPEND_DAYS} days">${cols}</div>
-          <div class="spend-axis"><span>${esc(dayLabel(keys[0]))}</span><span>Today</span></div>
+          <div class="spend-peak">Peak ${range.bucket > 1 ? "week " : ""}<b>${esc(money(peak.cost))}</b> · ${esc(bucketLabel(peak))}</div>
+          <div class="cols${sel ? " has-sel" : ""}" role="group" aria-label="${unit} spend, last ${esc(range.label)}">${cols}</div>
+          <div class="spend-axis"><span>${esc(dayLabel(buckets[0].key))}</span><span>Today</span></div>
         </div>
+      ` : ""}
 
+      ${total > 0 ? `
         <div class="spend-detail">
           <div class="spend-detail-head">
-            <span>${sel ? esc(dayLabel(sel.key, { weekday: "short", month: "short", day: "numeric" })) : `Last ${SPEND_DAYS} days`}</span>
-            <b class="mono">${esc(money(scopeTotal))}</b>
+            <span>${sel ? esc(bucketLabel(sel, { weekday: "short", month: "short", day: "numeric" }))
+              : range.days === 1 ? "Today" : `Last ${esc(range.label)}`}</span>
+            <b class="mono">${esc(money(scope.cost))}</b>
           </div>
           ${models.map((m) => {
-            const share = scopeTotal > 0 ? Math.round((m.cost / scopeTotal) * 100) : 0;
+            const share = scope.cost > 0 ? Math.round((m.cost / scope.cost) * 100) : 0;
             return `
               <div class="model">
                 <span class="model-name">${esc(m.name)}</span>
@@ -449,53 +481,80 @@ function spendCard(c, p, keys) {
               </div>
             `;
           }).join("")}
-          ${sel && models.length === 0 ? `<div class="win-label">No spend recorded.</div>` : ""}
+          ${sel && models.length === 0 ? `<div class="spend-none">No spend recorded.</div>` : ""}
         </div>
       ` : ""}
 
-      <footer class="card-foot">
-        <span>Today <b>${esc(money(today))}</b></span>
-        <span>Avg/day <b>${esc(money(total30 / SPEND_DAYS))}</b></span>
-        ${otherPeriod ? `<span>${esc(c.historyLabel ?? c.reportingPeriod)} <b>${esc(money(periodTotal))}</b></span>` : ""}
-        ${incomplete > 0 ? `<span class="tag" title="${incomplete} request(s) without final usage are excluded">Incomplete</span>` : ""}
-      </footer>
+      ${range.days > 1 || incomplete > 0 ? `
+        <footer class="card-foot">
+          ${range.days > 1 ? `<span>Today <b>${esc(money(today))}</b></span>` : ""}
+          ${range.days > 1 ? `<span>Avg/day <b>${esc(money(total / range.days))}</b></span>` : ""}
+          ${incomplete > 0 ? `<span class="tag" title="${incomplete} request(s) without final usage are excluded">Incomplete</span>` : ""}
+        </footer>
+      ` : ""}
     </section>
+  `;
+}
+
+function rangePicker() {
+  return `
+    <nav class="seg" role="tablist" aria-label="Spend range">
+      ${Object.entries(SPEND_RANGES).map(([id, r]) =>
+        `<button class="seg-btn" role="tab" data-range="${id}" aria-selected="${id === spendRange}">${esc(r.label)}</button>`).join("")}
+    </nav>
   `;
 }
 
 function renderSpend(snap, data) {
   if (!data) {
-    return `<p class="empty">${costError ? `Can't load spend (${esc(costError)}).` : "Loading spend\u2026"}</p>`;
+    return `${rangePicker()}<p class="empty">${costError ? `Can't load spend (${esc(costError)}).` : "Loading spend…"}</p>`;
   }
+  const range = SPEND_RANGES[spendRange];
+  const buckets = spendBuckets(range);
   const meta = new Map((snap?.providers ?? []).map((p) => [p.id, p]));
   const rows = (data.providers ?? [])
-    .filter((c) => errText(c.error) || (c.daily ?? []).some((d) => d.totalCost > 0))
-    .sort((a, b) => (meta.get(a.provider)?.display?.sortKey ?? 999) - (meta.get(b.provider)?.display?.sortKey ?? 999));
-  if (rows.length === 0) return `<p class="empty">No local spend recorded in the last ${SPEND_DAYS} days.</p>`;
-
-  const keys = spendDays();
-  const estimate = rows.some((c) => c.provenance === "listPriceEstimate");
+    .map((c) => ({ c, total: spendSeries(c, buckets).total }))
+    .filter(({ c, total }) => errText(c.error) || total > 0)
+    .sort((a, b) => (meta.get(a.c.provider)?.display?.sortKey ?? 999) - (meta.get(b.c.provider)?.display?.sortKey ?? 999));
   const stale = costError
-    ? `<div class="status">Couldn't refresh spend (${esc(costError)}) \u2014 showing the last copy.</div>`
+    ? `<div class="status">Couldn't refresh spend (${esc(costError)}) — showing the last copy.</div>`
     : "";
+  if (rows.length === 0) {
+    const when = range.days === 1 ? "today" : `in the last ${range.label}`;
+    return `${rangePicker()}${stale}<p class="empty">No local spend recorded ${esc(when)}.</p>`;
+  }
+
+  const total = sum(rows.map((r) => r.total));
+  // Today has no average to speak of; yesterday is the comparison that means something.
+  const yesterday = sum(rows.map(({ c }) => spendSeries(c, [{ key: "y", days: lastDays(2).slice(0, 1) }]).total));
+  const estimate = rows.some(({ c }) => c.provenance === "listPriceEstimate");
   return `
+    ${rangePicker()}
     ${stale}
     <section class="spend-hero">
       <div>
-        <div class="hero-label">Today</div>
-        <div class="hero-value">${esc(money(sum(rows.map((c) => c.sessionCostUSD))))}</div>
+        <div class="hero-label">${range.days === 1 ? "Today" : `Last ${esc(range.label)}`}</div>
+        <div class="hero-value">${esc(money(total))}</div>
       </div>
       <div class="hero-side">
-        <div class="hero-label">Last ${SPEND_DAYS} days</div>
-        <div class="hero-sub">${esc(money(sum(rows.map((c) => c.last30DaysCostUSD))))}</div>
+        <div class="hero-label">${range.days === 1 ? "Yesterday" : "Avg/day"}</div>
+        <div class="hero-sub">${esc(money(range.days === 1 ? yesterday : total / range.days))}</div>
       </div>
-      ${estimate ? `<p class="hero-note">Estimated at API list prices from local logs \u2014 not what a subscription bills.</p>` : ""}
+      ${estimate ? `<p class="hero-note">Estimated at API list prices from local logs — not what a subscription bills.</p>` : ""}
     </section>
-    ${rows.map((c) => spendCard(c, meta.get(c.provider), keys)).join("")}
+    ${rows.map(({ c }) => spendCard(c, meta.get(c.provider), range, buckets)).join("")}
   `;
 }
 
 el.content.addEventListener("click", (e) => {
+  const pick = e.target.closest?.("[data-range]");
+  if (pick) {
+    spendRange = pick.dataset.range;
+    localStorage.setItem(RANGE_KEY, spendRange);
+    spendSel.clear(); // a picked day or week belongs to the range it was picked in
+    render();
+    return;
+  }
   const col = e.target.closest?.("[data-day]");
   if (!col) return;
   const { spend: id, day } = col.dataset;

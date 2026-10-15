@@ -14,7 +14,7 @@ Android/iOS PWA ──https──▶ tailscale serve ──▶ node :8899 (loopb
                                                  │                      + Host: 127.0.0.1
                                                  │                      + Authorization: Bearer …
                                                  │                                       codexbar serve
-                                                 ├── /api/cost     ──▶ 127.0.0.1:8087/cost (trimmed)
+                                                 ├── /api/cost     ──▶ codexbar cost --days 90 (trimmed)
                                                  ├── /api/pace     usage history per window → pace
                                                  └── /api/push/*   Web Push notifications
 ```
@@ -25,11 +25,14 @@ Four views, remembered across launches:
   windows in use a burndown sparkline and a pace line (see below).
 - **Resets** — every window across every provider, soonest reset first, with large countdowns.
 - **Dense** — one compact row per window.
-- **Spend** — today's and 30-day spend, then per provider a 30-day daily chart and the cost split
-  by model; tap a day to see that day's split. Comes from `codexbar serve`'s `/cost` (local log
-  scans priced at API list rates, so for a subscription it is a usage measure, not a bill). The
-  proxy drops Codex's per-project rows, which carry local paths, and is only asked for spend
-  while this view is open.
+- **Spend** — pick Today, 7, 30 or 90 days: the range total, then per provider a chart (daily
+  bars, weekly for 90 days) and the cost split by model; tap a bar to see that day's or week's
+  split. Comes from `codexbar cost --days 90`, local log scans priced at API list rates, so for a
+  subscription it is a usage measure, not a bill. The proxy runs the CLI rather than asking
+  `serve /cost`, which only covers the app's saved period (30 days by default); it drops Codex's
+  per-project rows, which carry local paths, and is only asked for spend while this view is open.
+  "Today" is since local midnight: the report has calendar-day buckets, so a rolling 24 hours
+  is not available.
 
 Every view leads with the *reserve* — the headroom left rather than the amount burnt: `35% left`
 per window (with `65% used` alongside it) and the remaining credit balance for providers that
@@ -172,6 +175,7 @@ Read from `~/.config/codexbar/dashboard.env` (mode 600):
 | `CBT_UPSTREAM_PORT` | `8087` | Where `codexbar serve` listens |
 | `CBT_CACHE_TTL` | `180` | Snapshot cache seconds; keep below 3× `serve --refresh-interval` or rows read as stale |
 | `CBT_COST_TTL` | `300` | Spend (`/api/cost`) cache seconds |
+| `CBT_CODEXBAR_BIN` | `~/.local/bin/codexbar`, else `codexbar` on `PATH` | CLI the spend report runs; the installer pins the one it found |
 | `CBT_HISTORY_POLL` | `900` | Refresh this often with no client around, so pace has readings; `0` records only client-driven fetches |
 | `CBT_HISTORY_PATH` | `~/.config/codexbar/usage-history.json` | Usage readings per window and the learned window lengths |
 | `CBT_UPSTREAM_TIMEOUT` | `90` | Upstream deadline; keep above `serve --request-timeout` |

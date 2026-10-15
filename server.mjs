@@ -14,6 +14,8 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import zlib from "node:zlib";
 import os from "node:os";
+import { execFile } from "node:child_process";
+import { existsSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import {
   getVapidKeys,
@@ -478,18 +480,24 @@ function paceBody() {
   return JSON.stringify({ generatedAt: new Date().toISOString(), windows: snap ? history.report(snap) : {} });
 }
 
-/* ---------------- spend history (`serve /cost`) ---------------- */
+/* ---------------- spend history (`codexbar cost`) ---------------- */
 
 // Only the Spend view asks for this, so it is fetched on demand and never polled. Spend
-// moves slowly and `/cost` is a local log scan, so it gets its own, longer TTL.
+// moves slowly and the cost scan reads local logs, so it gets its own, longer TTL.
 const COST_TTL_MS = envNumber("CBT_COST_TTL", 300, { min: 0 }) * 1000;
+// The phone offers ranges up to 90 days. `serve /cost` only takes `provider` and follows the
+// app's saved period (30 days by default), so the proxy runs the CLI with an explicit window
+// instead and the phone slices the shorter ranges out of it.
+const COST_DAYS = 90;
+const LOCAL_CODEXBAR = path.join(os.homedir(), ".local", "bin", "codexbar");
+const CODEXBAR_BIN = process.env.CBT_CODEXBAR_BIN ?? (existsSync(LOCAL_CODEXBAR) ? LOCAL_CODEXBAR : "codexbar");
 
 /** @type {{body: string, at: number} | null} */
 let costCache = null;
 /** @type {Promise<{body: string, at: number}> | null} */
 let costInFlight = null;
 
-// What the phone needs from `/cost`: per-day totals with their model split. Codex's
+// What the phone needs from the cost report: per-day totals with their model split. Codex's
 // `projects[]` repeats every day once per project and carries local filesystem paths,
 // so it is dropped rather than shipped over the tailnet to be ignored.
 function trimCost(body) {
@@ -510,9 +518,25 @@ function trimCost(body) {
   return JSON.stringify({ generatedAt: new Date().toISOString(), providers });
 }
 
+/** `codexbar cost --days 90 --format json`: the same payload as `serve /cost`, wider. */
+function fetchCost() {
+  return new Promise((resolve, reject) => {
+    execFile(
+      CODEXBAR_BIN,
+      ["cost", "--days", String(COST_DAYS), "--format", "json"],
+      { timeout: UPSTREAM_TIMEOUT_MS, maxBuffer: 32 * 1024 * 1024 },
+      (err, stdout, stderr) => {
+        // stderr also carries notes such as "Skipping providers without local cost usage".
+        if (err) reject(new Error(`codexbar cost: ${(stderr || err.message).trim().slice(0, 200)}`));
+        else resolve({ body: stdout, at: Date.now() });
+      },
+    );
+  });
+}
+
 function refreshCost() {
   if (!costInFlight) {
-    costInFlight = fetchUpstream("/cost")
+    costInFlight = fetchCost()
       .then((fresh) => {
         costCache = { body: trimCost(fresh.body), at: fresh.at };
         return costCache;
