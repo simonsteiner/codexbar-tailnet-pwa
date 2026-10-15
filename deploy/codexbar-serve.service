@@ -6,7 +6,7 @@ After=network-online.target
 Type=simple
 # Token comes from the environment, never argv, so it stays out of `ps`.
 EnvironmentFile=%h/.config/codexbar/dashboard.env
-ExecStart=__CODEXBAR__ serve --host 127.0.0.1 --port __UPSTREAM_PORT__ --refresh-interval 60 --request-timeout 45
+ExecStart=__CODEXBAR__ serve --host 127.0.0.1 --port __UPSTREAM_PORT__ --refresh-interval 120 --request-timeout 45
 Restart=always
 RestartSec=5
 

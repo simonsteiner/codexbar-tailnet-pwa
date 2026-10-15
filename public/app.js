@@ -878,7 +878,11 @@ const bootIsCurrent = snapshot === boot?.snapshot
 if (!bootIsCurrent) load();
 
 setTimeout(loadVersion, 2000);
+// A hidden window still ticks about once a minute, and every tick keeps the proxy's poller
+// fetching providers, which is how a minimised PWA got Claude's OAuth endpoint rate limited.
+// Coming back into view reloads anyway (the visibilitychange handler).
 setInterval(() => {
+  if (document.hidden) return;
   load();
   maybeLoadCost();
 }, REFRESH_MS);

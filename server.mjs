@@ -41,7 +41,10 @@ const BIND = process.env.CBT_BIND ?? "127.0.0.1";
 const UPSTREAM_HOST = process.env.CBT_UPSTREAM_HOST ?? "127.0.0.1";
 const UPSTREAM_PORT = Number(process.env.CBT_UPSTREAM_PORT ?? 8087);
 const TOKEN = process.env.CODEXBAR_DASHBOARD_TOKEN ?? "";
-const CACHE_TTL_MS = Number(process.env.CBT_CACHE_TTL ?? 60) * 1000;
+// Each refresh is a live provider fetch (serve's own cache is shorter), and Claude's OAuth
+// usage endpoint started answering 429 at the old 60 s TTL (~40 calls/h). Window percentages barely move
+// in 3 minutes. Keep it under serve's staleAfterSeconds (3x its --refresh-interval).
+const CACHE_TTL_MS = Number(process.env.CBT_CACHE_TTL ?? 180) * 1000;
 // `serve` can take a while when a provider is slow; keep this above its --request-timeout.
 const UPSTREAM_TIMEOUT_MS = Number(process.env.CBT_UPSTREAM_TIMEOUT ?? 90) * 1000;
 // How long after the last client request the background poller keeps the cache warm.

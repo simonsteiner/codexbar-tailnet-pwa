@@ -170,7 +170,7 @@ Read from `~/.config/codexbar/dashboard.env` (mode 600):
 | `CBT_PORT` | `8899` | Local listen port |
 | `CBT_BIND` | `127.0.0.1` | Keep on loopback — `tailscale serve` fronts it |
 | `CBT_UPSTREAM_PORT` | `8087` | Where `codexbar serve` listens |
-| `CBT_CACHE_TTL` | `60` | Snapshot cache seconds |
+| `CBT_CACHE_TTL` | `180` | Snapshot cache seconds; keep below 3× `serve --refresh-interval` or rows read as stale |
 | `CBT_COST_TTL` | `300` | Spend (`/api/cost`) cache seconds |
 | `CBT_HISTORY_POLL` | `900` | Refresh this often with no client around, so pace has readings; `0` records only client-driven fetches |
 | `CBT_HISTORY_PATH` | `~/.config/codexbar/usage-history.json` | Usage readings per window and the learned window lengths |
