@@ -36,6 +36,7 @@ const el = {
   healthDialog: document.getElementById("health-dialog"),
   healthClose: document.getElementById("health-close"),
   healthInfo: document.getElementById("health-info"),
+  healthActions: document.getElementById("health-actions"),
 };
 
 let snapshot = null;
@@ -769,14 +770,103 @@ function healthRows(s) {
   return rows.map(([k, v]) => `<dt>${k}</dt><dd>${v}</dd>`).join("");
 }
 
+const JOB_STATE = {
+  running: ["t-warn", "Working…"],
+  succeeded: ["t-ok", "Done"],
+  failed: ["t-crit", "Failed — nothing was changed"],
+  "rolled-back": ["t-crit", "Rolled back — serve wasn't healthy on the new version"],
+};
+
+/** Update / switch-version controls, for whoever the proxy says may use them. */
+function healthActions(s) {
+  const admin = s?.admin;
+  const latest = s?.codexbar?.latest;
+  if (!admin?.allowed) {
+    // Say why only when there is something to do; otherwise the dialog stays quiet.
+    return s?.codexbar?.updateAvailable && admin?.reason ? `<p class="note">${esc(admin.reason)}.</p>` : "";
+  }
+  if (admin.reason) return `<p class="note">Can't update from here: ${esc(admin.reason)}.</p>`;
+  const job = admin.job;
+  const busy = job?.state === "running";
+  const parts = [];
+  if (job) {
+    const [cls, label] = JOB_STATE[job.state] ?? ["", job.state];
+    const what = job.action === "update" ? `Install ${job.target}` : `Switch to ${job.target}`;
+    parts.push(`<div class="job-state"><span class="${cls}">${esc(label)}</span> · ${esc(what)}</div>`);
+    const lines = job.log.map((l) => `${clock(l.at)}  ${l.msg}`).join("\n");
+    parts.push(`<pre class="job-log">${esc(lines)}</pre>`);
+  }
+  if (!busy && s.codexbar.updateAvailable && latest?.tag) {
+    parts.push(`<button class="btn btn-primary" data-action="update" data-tag="${esc(latest.tag)}">Update to ${esc(latest.tag)}</button>`);
+  }
+  const others = (admin.installs ?? []).filter((i) => !i.current);
+  if (!busy && others.length) {
+    // Preselect the newest glibc build: switching back is usually "the one before", and musl
+    // builds are the ones known to crash serve (the smoke test would refuse them anyway).
+    const pick = (others.find((i) => !i.musl) ?? others[0]).name;
+    const opts = others.map((i) =>
+      `<option value="${esc(i.name)}"${i.name === pick ? " selected" : ""}>${esc(i.name)}${i.musl ? " (musl)" : ""}</option>`).join("");
+    parts.push(`<details><summary>Switch to an installed version</summary>
+      <div class="switch"><select id="rollback-to" aria-label="Installed version">${opts}</select>
+      <button class="btn btn-secondary" data-action="rollback">Switch</button></div></details>`);
+  }
+  return parts.join("");
+}
+
+let jobPoll = null;
+
 function renderHealth() {
   const level = status?.health?.level ?? "ok";
   el.healthDot?.classList.toggle("warn", level === "warn");
   el.healthDot?.classList.toggle("down", level === "down");
   if (el.healthBtn) el.healthBtn.title = status?.health?.reason ?? "Service status";
   if (el.updatePill) el.updatePill.hidden = !status?.codexbar?.updateAvailable;
-  if (el.healthDialog?.open) el.healthInfo.innerHTML = healthRows(status);
+  if (el.healthDialog?.open) {
+    el.healthInfo.innerHTML = healthRows(status);
+    // Re-rendering the controls would close an open <details> and reset the <select> under the
+    // user's finger every poll, so they are only replaced when they actually changed.
+    const html = healthActions(status);
+    if (el.healthActions.dataset.html !== html) {
+      el.healthActions.innerHTML = html;
+      el.healthActions.dataset.html = html;
+      el.healthActions.querySelector(".job-log")?.scrollTo(0, 1e6);
+    }
+  }
+  // Follow a running job closely while someone is watching it.
+  const running = status?.admin?.job?.state === "running";
+  if (running && el.healthDialog?.open && !jobPoll) {
+    jobPoll = setTimeout(() => { jobPoll = null; loadStatus(); }, 2000);
+  }
 }
+
+async function adminPost(route, body) {
+  try {
+    const res = await fetch(route, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "X-CodexBar-Admin": "1" },
+      body: JSON.stringify(body),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`);
+  } catch (err) {
+    alert(err.message);
+  }
+  await loadStatus();
+}
+
+el.healthActions?.addEventListener("click", (e) => {
+  const btn = e.target.closest("button[data-action]");
+  if (!btn) return;
+  if (btn.dataset.action === "update") {
+    const tag = btn.dataset.tag;
+    if (!confirm(`Install CodexBar ${tag} and restart serve?\n\nIt is smoke-tested first and rolled back automatically if serve doesn't come up healthy.`)) return;
+    adminPost("/api/admin/update", { tag });
+  } else {
+    const to = el.healthActions.querySelector("#rollback-to")?.value;
+    if (!to || !confirm(`Switch CodexBar to ${to} and restart serve?`)) return;
+    adminPost("/api/admin/rollback", { to });
+  }
+});
 
 async function loadStatus() {
   try {
@@ -795,8 +885,8 @@ function noteOutage(down) {
 }
 
 el.healthBtn?.addEventListener("click", () => {
-  el.healthInfo.innerHTML = healthRows(status);
   el.healthDialog?.showModal();
+  renderHealth();
   loadStatus();
 });
 el.healthClose?.addEventListener("click", () => el.healthDialog?.close());

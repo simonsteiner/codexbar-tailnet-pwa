@@ -30,6 +30,7 @@ import {
   DEFAULT_PUSH_TTL_SECONDS,
 } from "./push.mjs";
 import { UsageHistory } from "./history.mjs";
+import { Updater } from "./updater.mjs";
 import { UpstreamHealth, ServeMonitor, parseSystemctlShow, parseVersion, compareVersions } from "./health.mjs";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
@@ -721,6 +722,52 @@ function statusBody() {
   };
 }
 
+/* ---------------- updating codexbar from the PWA ---------------- */
+
+// Who may install or switch CodexBar versions: tailnet logins, as `tailscale serve` reports them
+// in Tailscale-User-Login. serve overwrites that header (a client-sent one never gets through),
+// so it is trustworthy on requests that came through it — which is why the proxy must stay on
+// loopback for this. Empty = updating from the PWA is off.
+const ADMIN_LOGINS = (process.env.CBT_ADMIN_LOGINS ?? "").split(",").map((s) => s.trim().toLowerCase()).filter(Boolean);
+const LOOPBACK = /^(?:127\.|::1$|::ffff:127\.|localhost$)/;
+
+const updater = new Updater({
+  installRoot: process.env.CBT_INSTALL_ROOT ?? path.join(os.homedir(), ".local", "opt", "codexbar"),
+  binLink: process.env.CBT_BIN_LINK ?? path.join(os.homedir(), ".local", "bin", "CodexBarCLI"),
+  serveUnit: SERVE_UNIT,
+  repo: RELEASE_REPO,
+  variant: process.env.CBT_UPDATE_VARIANT ?? "",
+  verifyServe: () => refresh({ force: true }),
+  quiet: (until) => monitor.quiet(until),
+  onChange: () => {
+    costCache = null; // spend came from the old binary
+    probeInstalled({ force: true }).catch(() => {});
+  },
+});
+
+/** Why this request may not run admin actions, or null when it may. */
+function adminDenied(req) {
+  if (ADMIN_LOGINS.length === 0) return "updating from here is off (set CBT_ADMIN_LOGINS)";
+  if (!LOOPBACK.test(BIND)) return "updating from here needs CBT_BIND on loopback";
+  if (!LOOPBACK.test(req.socket.remoteAddress ?? "")) return "request didn't come through tailscale serve";
+  const login = String(req.headers["tailscale-user-login"] ?? "").toLowerCase();
+  if (!login) return "no tailnet identity on this request";
+  if (!ADMIN_LOGINS.includes(login)) return `${login} may not update CodexBar`;
+  return null;
+}
+
+/** What only an admin's status dialog needs: the job, the installs to switch between. */
+async function adminStatus(req) {
+  const reason = adminDenied(req);
+  if (reason) return { allowed: false, reason };
+  return {
+    allowed: true,
+    reason: await updater.unsupported(),
+    job: updater.status(),
+    installs: await updater.installs(),
+  };
+}
+
 await Promise.all([sampleHealth(), probeInstalled()]);
 setInterval(() => { sampleHealth().catch(() => {}); }, STATUS_PROBE_MS).unref?.();
 if (RELEASE_CHECK_MS > 0) {
@@ -885,10 +932,37 @@ const server = http.createServer(async (req, res) => {
     if (!serveUnit || Date.now() - serveUnit.probedAt > 15_000) await probeUnit();
     await probeInstalled();
     const json = "application/json; charset=utf-8";
-    const body = JSON.stringify(statusBody());
+    const body = JSON.stringify({ ...statusBody(), admin: await adminStatus(req) });
     sendBody(req, res, 200, { "Content-Type": json, "Cache-Control": "no-store" }, body,
       shouldGzip(req, json, Buffer.byteLength(body)));
     return;
+  }
+
+  if (urlPath === "/api/admin/update" || urlPath === "/api/admin/rollback") {
+    const reply = (status, obj) => {
+      res.writeHead(status, { "Content-Type": "application/json; charset=utf-8", "Cache-Control": "no-store" });
+      res.end(JSON.stringify(obj));
+    };
+    if (req.method !== "POST") return reply(405, { error: "method not allowed" });
+    // A page on another origin can't set a custom header without a CORS preflight, which this
+    // server never answers — so together with Sec-Fetch-Site this keeps the routes same-origin.
+    const crossSite = req.headers["sec-fetch-site"] && req.headers["sec-fetch-site"] !== "same-origin";
+    if (req.headers["x-codexbar-admin"] !== "1" || crossSite) return reply(403, { error: "same-origin requests only" });
+    const denied = adminDenied(req);
+    if (denied) return reply(403, { error: denied });
+    try {
+      const body = await readJsonBody(req);
+      const login = req.headers["tailscale-user-login"];
+      if (urlPath === "/api/admin/update") {
+        const tag = body.tag ?? latestRelease?.tag;
+        console.log(`update: ${login} asked for ${tag}`);
+        return reply(202, await updater.startUpdate(tag));
+      }
+      console.log(`update: ${login} asked to switch to ${body.to}`);
+      return reply(202, await updater.startRollback(body.to));
+    } catch (err) {
+      return reply(409, { error: err.message });
+    }
   }
 
   if (urlPath === "/api/version") {

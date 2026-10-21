@@ -131,6 +131,41 @@ and a "back" notice (same tag, so it replaces the first) on recovery. The releas
 GitHub's unauthenticated API every `CBT_RELEASE_CHECK` hours and keeps its last good answer when
 GitHub is unreachable.
 
+## Updating CodexBar from the app
+
+With `CBT_ADMIN_LOGINS` set, the status dialog gets an **Update to vX.Y.Z** button when a newer
+release is out, and a picker to switch to any install already on disk. Either one:
+
+1. downloads `CodexBarCLI-vX.Y.Z-linux-<arch>.tar.gz` and its `.sha256` from the release (GitHub
+   hosts only) and checks the digest; *(update only)*
+2. lists the tarball and refuses absolute paths, `..` and escaping symlinks before extracting it
+   into a fresh `~/.local/opt/codexbar/X.Y.Z/` (or `X.Y.Z-<timestamp>` if that exists); *(update only)*
+3. smoke-tests the binary: no unresolved libraries in `ldd` (the 0.78.0 `libxml2.so.2` break),
+   `--version` matches, and a **cold** `cost --days 90` scan against an empty cache exits cleanly
+   (the 0.78.0-musl segfault). ~20-30 s;
+4. swaps `~/.local/bin/CodexBarCLI` atomically and restarts `CBT_SERVE_UNIT`;
+5. requires serve to answer a snapshot and then run 60 s without systemd restarting it. Otherwise it
+   points the symlink back, restarts serve again, and reports **Rolled back**.
+
+A failure before step 4 changes nothing. Nothing is ever deleted except the job's own download and
+staging directories, so every install stays available to switch back to. Progress streams into the
+dialog; the down-alert push is held back while the job restarts serve.
+
+Who may do this: requests must come through `tailscale serve`, which sets `Tailscale-User-Login`
+to the caller's tailnet login and overwrites any value the client sent, and that login must be in
+`CBT_ADMIN_LOGINS`. That is only trustworthy while the proxy listens on loopback, so admin actions
+are refused when `CBT_BIND` isn't. The POST routes also need an `X-CodexBar-Admin: 1` header and
+a same-origin `Sec-Fetch-Site`, which a page on another origin can't send without a CORS preflight
+this server never answers. A process on the box itself can still reach `127.0.0.1:8899` and claim
+any login — it runs as you anyway.
+
+| Var | Default | Meaning |
+| --- | --- | --- |
+| `CBT_ADMIN_LOGINS` | *(empty: off)* | Comma-separated tailnet logins allowed to update/switch |
+| `CBT_INSTALL_ROOT` | `~/.local/opt/codexbar` | Versioned installs |
+| `CBT_BIN_LINK` | `~/.local/bin/CodexBarCLI` | The symlink serve's unit runs through; must point into the install root |
+| `CBT_UPDATE_VARIANT` | *(glibc)* | `musl` to install the static build instead |
+
 ## Why a proxy instead of pointing the phone at `codexbar serve`
 
 Three concrete blockers, all handled here:

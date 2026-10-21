@@ -163,6 +163,9 @@ async function runTests() {
         CBT_RELEASE_CHECK: "0",
         CBT_SERVE_UNIT: "cbt-test-does-not-exist.service",
         CBT_CODEXBAR_BIN: "/bin/false",
+        CBT_ADMIN_LOGINS: "Me@Example.com",
+        CBT_BIN_LINK: path.join(dir, "no-such-link"),
+        CBT_INSTALL_ROOT: path.join(dir, "opt"),
       },
       stdio: ["ignore", "pipe", "pipe"],
     });
@@ -216,7 +219,25 @@ async function runTests() {
       assert.strictEqual(st.codexbar.version, null);
       assert.strictEqual(st.codexbar.updateAvailable, false);
       assert.ok(st.snapshot.at);
-      console.log("✓ Test 7 passed: dead upstream reported, backed off, recovered; /api/status");
+      assert.strictEqual(st.admin.allowed, false, "no tailnet identity on a direct request");
+
+      // Admin routes: POST only, same-origin only, and only for a listed tailnet login.
+      const post = (headers) => fetch(`http://127.0.0.1:${port}/api/admin/update`, {
+        method: "POST", headers: { "Content-Type": "application/json", ...headers }, body: JSON.stringify({ tag: "v0.79.0" }),
+      }).then(async (r) => ({ status: r.status, error: (await r.json()).error }));
+      const admin = { "X-CodexBar-Admin": "1" };
+      assert.strictEqual((await get(port, "/api/admin/update")).status, 405);
+      assert.match((await post({})).error, /same-origin/);
+      assert.match((await post({ ...admin, "Sec-Fetch-Site": "cross-site", "Tailscale-User-Login": "me@example.com" })).error, /same-origin/);
+      assert.match((await post(admin)).error, /no tailnet identity/);
+      assert.match((await post({ ...admin, "Tailscale-User-Login": "eve@example.com" })).error, /may not update/);
+      const allowed = await post({ ...admin, "Tailscale-User-Login": "me@example.com" });
+      assert.strictEqual(allowed.status, 409, "past the gate; refused only because this box has no install");
+      assert.match(allowed.error, /not a symlink/);
+      const st2 = await fetch(`http://127.0.0.1:${port}/api/status`, { headers: { "Tailscale-User-Login": "ME@example.com" } }).then((r) => r.json());
+      assert.strictEqual(st2.admin.allowed, true);
+      assert.match(st2.admin.reason, /not a symlink/);
+      console.log("✓ Test 7 passed: dead upstream reported, backed off, recovered; /api/status; admin gate");
     } finally {
       // It saves its state on SIGTERM; let that finish before the directory goes.
       await new Promise((r) => { child.once("exit", r); child.kill(); });
