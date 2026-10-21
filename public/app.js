@@ -890,11 +890,12 @@ function noteOutage(down) {
   loadStatus();
 }
 
-el.healthBtn?.addEventListener("click", () => {
-  el.healthDialog?.showModal();
+function openStatus() {
+  if (!el.healthDialog?.open) el.healthDialog?.showModal();
   renderHealth();
   loadStatus();
-});
+}
+el.healthBtn?.addEventListener("click", openStatus);
 el.healthClose?.addEventListener("click", () => el.healthDialog?.close());
 el.healthDialog?.addEventListener("click", (e) => {
   if (e.target === el.healthDialog) el.healthDialog.close();
@@ -1159,6 +1160,11 @@ if (boot?.upstream && !boot.upstream.ok) {
 }
 
 renderHealth();
+// A "new release" push opens the app at /?status.
+if (new URLSearchParams(location.search).has("status")) {
+  history.replaceState(null, "", "/");
+  openStatus();
+}
 setTimeout(loadVersion, 2000);
 setTimeout(loadStatus, 2000);
 // A hidden window still ticks about once a minute, and every tick keeps the proxy's poller
@@ -1189,6 +1195,7 @@ if ("serviceWorker" in navigator) {
   });
   navigator.serviceWorker.addEventListener("message", (e) => {
     if (e.data?.type === "shell-updated") reloadOnce();
+    if (e.data?.type === "open" && e.data.what === "status") openStatus();
   });
   navigator.serviceWorker.register("/sw.js")
     .then((reg) => {

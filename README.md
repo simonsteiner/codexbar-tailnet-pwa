@@ -131,6 +131,12 @@ and a "back" notice (same tag, so it replaces the first) on recovery. The releas
 GitHub's unauthenticated API every `CBT_RELEASE_CHECK` hours and keeps its last good answer when
 GitHub is unreachable.
 
+A newer release is pushed once — *CodexBar v0.80.0 is out* — and tapping it opens the status
+dialog (`/?status`). The push, like the Update pill, waits until the release's Linux CLI tarball
+is attached: GitHub publishes a release before its binaries finish uploading. The last tag
+announced is kept in `~/.config/codexbar/release-announced.json`; with no push subscribers the
+release stays unannounced, so the next device to subscribe still hears about it.
+
 ## Updating CodexBar from the app
 
 With `CBT_ADMIN_LOGINS` set, the status dialog gets an **Update to vX.Y.Z** button when a newer
@@ -147,8 +153,11 @@ release is out, and a picker to switch to any install already on disk. Either on
 5. requires serve to answer a snapshot and then run 60 s without systemd restarting it. Otherwise it
    points the symlink back, restarts serve again, and reports **Rolled back**.
 
-A failure before step 4 changes nothing. Nothing is ever deleted except the job's own download and
-staging directories, so every install stays available to switch back to. Progress streams into the
+A failure before step 4 changes nothing. After a **successful update** the install root is pruned
+to the active install, the one it replaced, and the newest `CBT_KEEP_INSTALLS` other glibc builds
+(musl builds never count as a rollback); a failed, rolled-back or switch-only job deletes nothing
+but its own download and staging directories. Older versions are a re-download away — the update
+route takes any tag. Progress streams into the
 dialog; the down-alert push is held back while the job restarts serve.
 
 Who may do this: requests must come through `tailscale serve`, which sets `Tailscale-User-Login`
@@ -165,6 +174,7 @@ any login — it runs as you anyway.
 | `CBT_INSTALL_ROOT` | `~/.local/opt/codexbar` | Versioned installs |
 | `CBT_BIN_LINK` | `~/.local/bin/CodexBarCLI` | The symlink serve's unit runs through; must point into the install root |
 | `CBT_UPDATE_VARIANT` | *(glibc)* | `musl` to install the static build instead |
+| `CBT_KEEP_INSTALLS` | `2` | Older glibc installs kept after an update, besides the replaced one; `0` = never prune |
 
 ## Why a proxy instead of pointing the phone at `codexbar serve`
 

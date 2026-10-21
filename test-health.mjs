@@ -1,6 +1,6 @@
 import {
   UpstreamHealth, retryDelay, RETRY_BASE_MS, RETRY_MAX_MS,
-  ServeMonitor, parseSystemctlShow, parseVersion, compareVersions,
+  ServeMonitor, parseSystemctlShow, parseVersion, compareVersions, shouldAnnounceRelease,
 } from "./health.mjs";
 import assert from "node:assert";
 import http from "node:http";
@@ -133,6 +133,19 @@ async function runTests() {
     assert.strictEqual(silent.sample({ at: T0 + 6 * MIN, unit: null, upstream: up3 }).event, null);
     assert.strictEqual(silent.level, "down");
     console.log("✓ Test 6 passed: unit state, quiet window, notify off");
+  }
+
+  // 6b: release pushes — once per newer tag, and only once the Linux CLI is attached
+  {
+    const asset = "CodexBarCLI-v0.80.0-linux-x86_64.tar.gz";
+    const latest = { tag: "v0.80.0", assets: [asset, `${asset}.sha256`] };
+    assert.strictEqual(shouldAnnounceRelease({ latest, installed: "0.79.0", announced: null, asset }), true);
+    assert.strictEqual(shouldAnnounceRelease({ latest, installed: "0.79.0", announced: "v0.80.0", asset }), false, "already announced");
+    assert.strictEqual(shouldAnnounceRelease({ latest, installed: "0.80.0", announced: null, asset }), false, "already installed");
+    assert.strictEqual(shouldAnnounceRelease({ latest: { tag: "v0.80.0", assets: ["CodexBar-macos-universal-0.80.0.zip"] }, installed: "0.79.0", announced: null, asset }), false, "binaries still uploading");
+    assert.strictEqual(shouldAnnounceRelease({ latest: { tag: "v0.81.0", assets: ["CodexBarCLI-v0.81.0-linux-x86_64.tar.gz"] }, installed: "0.79.0", announced: "v0.80.0", asset: "CodexBarCLI-v0.81.0-linux-x86_64.tar.gz" }), true, "a newer one than last announced");
+    assert.strictEqual(shouldAnnounceRelease({ latest, installed: null, announced: null, asset }), false, "unknown install");
+    console.log("✓ Test 6b passed: release announcement rules");
   }
 
   // 7: end to end — a serve that dies is reported as down, not "refreshing", and is not hammered

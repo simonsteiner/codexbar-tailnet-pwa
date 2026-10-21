@@ -30,8 +30,8 @@ import {
   DEFAULT_PUSH_TTL_SECONDS,
 } from "./push.mjs";
 import { UsageHistory } from "./history.mjs";
-import { Updater } from "./updater.mjs";
-import { UpstreamHealth, ServeMonitor, parseSystemctlShow, parseVersion, compareVersions } from "./health.mjs";
+import { Updater, assetName, linuxArch } from "./updater.mjs";
+import { UpstreamHealth, ServeMonitor, parseSystemctlShow, parseVersion, compareVersions, shouldAnnounceRelease } from "./health.mjs";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const PUBLIC_DIR = path.join(HERE, "public");
@@ -590,6 +590,9 @@ const DOWN_ALERT_S = envNumber("CBT_DOWN_ALERT", 600, { min: 0 });
 // Where "update available" comes from. Unauthenticated GitHub API, so keep it to a few calls a day.
 const RELEASE_REPO = process.env.CBT_RELEASE_REPO ?? "steipete/CodexBar";
 const RELEASE_CHECK_MS = envNumber("CBT_RELEASE_CHECK", 6, { min: 0 }) * 3_600_000;
+// The newest tag already pushed as "is out", so a restart doesn't announce it again.
+const RELEASE_STATE_PATH = path.join(CONFIG_DIR, "release-announced.json");
+const UPDATE_VARIANT = process.env.CBT_UPDATE_VARIANT ?? "";
 const STARTED_AT = Date.now();
 
 const monitor = new ServeMonitor({ alertAfterMs: (DOWN_ALERT_S || 600) * 1000, notify: DOWN_ALERT_S > 0 });
@@ -664,6 +667,31 @@ async function checkRelease() {
   }
 }
 
+let releaseAnnounced = null;
+try { releaseAnnounced = JSON.parse(await fs.readFile(RELEASE_STATE_PATH, "utf8")).tag ?? null; } catch { /* never announced */ }
+
+/** The CLI tarball this box would install for a tag, or null on an unsupported arch. */
+const installAsset = (tag) => (linuxArch() ? assetName(tag, linuxArch(), UPDATE_VARIANT) : null);
+
+/** One push per new release, once its Linux CLI is actually attached. */
+async function announceRelease() {
+  const latest = latestRelease?.tag ? latestRelease : null;
+  if (!latest || !shouldAnnounceRelease({ latest, installed: installed.version, announced: releaseAnnounced, asset: installAsset(latest.tag) })) return;
+  // Nobody to tell yet: leave it unannounced, so whoever subscribes next still hears about it.
+  if (!vapidKeys || subscriptionStore.count() === 0) return;
+  releaseAnnounced = latest.tag;
+  await fs.writeFile(RELEASE_STATE_PATH, JSON.stringify({ tag: latest.tag, at: new Date().toISOString() }));
+  console.log(`release: announcing ${latest.tag}`);
+  await deliverToAll({
+    title: `CodexBar ${latest.tag} is out`,
+    body: `You're on ${installed.version}.${ADMIN_LOGINS.length ? " Tap to review and update." : ""}`,
+    tag: "codexbar-release",
+    icon: "/icons/icon-192.png",
+    badge: "/icons/icon-192.png",
+    data: { url: "/?status", open: "status", release: latest.tag },
+  });
+}
+
 function pushHealth(event, reason, since) {
   console.log(`health: ${event}${reason ? ` (${reason})` : ""}`);
   if (!vapidKeys || subscriptionStore.count() === 0) return;
@@ -716,7 +744,9 @@ function statusBody() {
       path: installed.path,
       error: installed.error,
       latest: latestRelease && (({ assets, ...rest }) => rest)(latestRelease), // assets are the updater's business
-      updateAvailable: !!(latest && installed.version && compareVersions(latest.tag, installed.version) > 0),
+      // Installable, not merely published: the binaries land some minutes after the release does.
+      updateAvailable: !!(latest && installed.version && compareVersions(latest.tag, installed.version) > 0
+        && (!installAsset(latest.tag) || latest.assets.includes(installAsset(latest.tag)))),
     },
     proxy: { startedAt: iso(STARTED_AT), uptimeSeconds: Math.round((now - STARTED_AT) / 1000) },
   };
@@ -736,7 +766,8 @@ const updater = new Updater({
   binLink: process.env.CBT_BIN_LINK ?? path.join(os.homedir(), ".local", "bin", "CodexBarCLI"),
   serveUnit: SERVE_UNIT,
   repo: RELEASE_REPO,
-  variant: process.env.CBT_UPDATE_VARIANT ?? "",
+  variant: UPDATE_VARIANT,
+  keep: envNumber("CBT_KEEP_INSTALLS", 2, { min: 0, integer: true }),
   verifyServe: () => refresh({ force: true }),
   quiet: (until) => monitor.quiet(until),
   onChange: () => {
@@ -771,8 +802,11 @@ async function adminStatus(req) {
 await Promise.all([sampleHealth(), probeInstalled()]);
 setInterval(() => { sampleHealth().catch(() => {}); }, STATUS_PROBE_MS).unref?.();
 if (RELEASE_CHECK_MS > 0) {
-  checkRelease();
-  setInterval(checkRelease, RELEASE_CHECK_MS).unref?.();
+  const check = () => checkRelease()
+    .then(announceRelease)
+    .catch((err) => console.warn(`release: ${err.message}`));
+  check();
+  setInterval(check, RELEASE_CHECK_MS).unref?.();
 }
 
 // Nothing in an inlined document can close the tag that carries it. CSS and JS never

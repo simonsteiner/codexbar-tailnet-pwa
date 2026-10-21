@@ -109,6 +109,8 @@ self.addEventListener("notificationclick", (event) => {
       const windowClients = await self.clients.matchAll({ type: "window", includeUncontrolled: true });
       for (const client of windowClients) {
         if (client.url && "focus" in client) {
+          // An already-open window doesn't navigate to data.url, so tell it what to show.
+          if (event.notification.data?.open) client.postMessage({ type: "open", what: event.notification.data.open });
           return client.focus();
         }
       }
