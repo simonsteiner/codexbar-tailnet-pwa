@@ -36,12 +36,36 @@ body {
   background: linear-gradient(var(--bg) 70%, transparent);
 }
 
-.brand { display: flex; align-items: center; gap: 9px; }
-.brand h1 { font-size: 17px; font-weight: 650; margin: 0; letter-spacing: -0.01em; }
+.brand { font-size: 17px; font-weight: 650; margin: 0; letter-spacing: -0.01em; }
+.health-btn {
+  display: flex; align-items: center; gap: 9px;
+  background: none; border: 0; padding: 6px 4px; margin: -6px -4px;
+  color: inherit; font: inherit; letter-spacing: inherit;
+  cursor: pointer; -webkit-tap-highlight-color: transparent;
+}
 .brand-dot {
   width: 10px; height: 10px; border-radius: 3px;
   background: linear-gradient(135deg, var(--accent), var(--ok));
+  transition: background 200ms;
 }
+/* The logo dot doubles as the health light: amber while serve is failing, red once it has been for a while. */
+.brand-dot.warn { background: var(--warn); }
+.brand-dot.down { background: var(--crit); box-shadow: 0 0 8px var(--crit); animation: pulse 1.6s ease-in-out infinite; }
+@keyframes pulse { 50% { opacity: 0.45; } }
+@media (prefers-reduced-motion: reduce) { .brand-dot.down { animation: none; } }
+.update-pill {
+  font-size: 10.5px; font-weight: 650; letter-spacing: 0.02em; text-transform: uppercase;
+  padding: 2px 7px; border-radius: 999px;
+  background: rgba(110, 90, 255, 0.18); color: #b3a8ff; border: 1px solid rgba(110, 90, 255, 0.4);
+}
+
+.health-info {
+  display: grid; grid-template-columns: auto 1fr; gap: 8px 14px;
+  margin: 0 0 4px; font-size: 13.5px; line-height: 1.4;
+}
+.health-info dt { color: var(--muted); }
+.health-info dd { margin: 0; min-width: 0; overflow-wrap: anywhere; }
+.health-info a { color: var(--text); }
 
 .topbar-actions {
   display: flex;

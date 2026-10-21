@@ -12,10 +12,13 @@
 </head>
 <body>
 <header class="topbar">
-  <div class="brand">
-    <span class="brand-dot"></span>
-    <h1>CodexBar</h1>
-  </div>
+  <h1 class="brand">
+    <button id="health" class="health-btn" aria-label="CodexBar — service status" title="Service status">
+      <span id="health-dot" class="brand-dot"></span>
+      CodexBar
+      <span id="update-pill" class="update-pill" hidden>Update</span>
+    </button>
+  </h1>
   <div class="topbar-actions">
     <button id="notify" class="notify-btn" aria-label="Push notifications" title="Push notifications">
       <svg viewBox="0 0 24 24" width="19" height="19" aria-hidden="true">
@@ -61,6 +64,16 @@
       <button id="notify-toggle" class="btn btn-primary">Enable Notifications</button>
       <button id="notify-test" class="btn btn-secondary" hidden>Send Test Notification</button>
     </div>
+  </div>
+</dialog>
+
+<dialog id="health-dialog" class="notify-dialog">
+  <div class="dialog-card">
+    <div class="dialog-head">
+      <h2>Status</h2>
+      <button id="health-close" class="dialog-close" aria-label="Close">&times;</button>
+    </div>
+    <dl id="health-info" class="health-info"><dt>Status</dt><dd>Checking…</dd></dl>
   </div>
 </dialog>
 

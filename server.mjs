@@ -30,7 +30,7 @@ import {
   DEFAULT_PUSH_TTL_SECONDS,
 } from "./push.mjs";
 import { UsageHistory } from "./history.mjs";
-import { UpstreamHealth } from "./health.mjs";
+import { UpstreamHealth, ServeMonitor, parseSystemctlShow, parseVersion, compareVersions } from "./health.mjs";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const PUBLIC_DIR = path.join(HERE, "public");
@@ -237,6 +237,8 @@ async function handleSnapshotRenewals(snap) {
 
   scheduleNextResetCheck(windows);
 }
+
+const iso = (t) => (t == null ? null : new Date(t).toISOString());
 
 // Shown in the UI footer. Read straight out of .git rather than shelling out to git,
 // so this stays stdlib-only and works when the unit's PATH has no git on it.
@@ -575,6 +577,157 @@ async function getCost() {
   return { ...(await pending), refreshing: false };
 }
 
+/* ---------------- serve status & upstream releases ---------------- */
+
+// The proxy runs as the same user as serve's unit, so `systemctl --user` can see it. That is
+// what catches a crash loop: between crashes the port answers and the unit reads "activating",
+// but NRestarts keeps climbing.
+const SERVE_UNIT = process.env.CBT_SERVE_UNIT ?? "codexbar-serve.service";
+const STATUS_PROBE_MS = 60_000;
+// Push "serve is down" after this many seconds degraded, and "back" when it recovers. 0 = no pushes.
+const DOWN_ALERT_S = envNumber("CBT_DOWN_ALERT", 600, { min: 0 });
+// Where "update available" comes from. Unauthenticated GitHub API, so keep it to a few calls a day.
+const RELEASE_REPO = process.env.CBT_RELEASE_REPO ?? "steipete/CodexBar";
+const RELEASE_CHECK_MS = envNumber("CBT_RELEASE_CHECK", 6, { min: 0 }) * 3_600_000;
+const STARTED_AT = Date.now();
+
+const monitor = new ServeMonitor({ alertAfterMs: (DOWN_ALERT_S || 600) * 1000, notify: DOWN_ALERT_S > 0 });
+/** @type {(ReturnType<typeof parseSystemctlShow> & {probedAt: number}) | null} */
+let serveUnit = null;
+let unitError = null;
+/** What `codexbar --version` says for the binary the symlink chain currently ends at. */
+let installed = { version: null, path: null, error: null };
+/** @type {{tag: string, name: string, url: string, publishedAt: string, assets: string[], checkedAt: string} | {error: string, checkedAt: string} | null} */
+let latestRelease = null;
+
+function run(cmd, args, timeout) {
+  return new Promise((resolve, reject) => {
+    execFile(cmd, args, { timeout, maxBuffer: 4 * 1024 * 1024 }, (err, stdout, stderr) => {
+      if (err) reject(new Error(`${path.basename(cmd)}: ${(stderr || err.message).trim().slice(0, 300)}`));
+      else resolve(stdout);
+    });
+  });
+}
+
+async function probeUnit() {
+  try {
+    const out = await run("systemctl", [
+      "--user", "show", SERVE_UNIT, "--timestamp=unix",
+      "-p", "LoadState,ActiveState,SubState,Result,NRestarts,MainPID,ActiveEnterTimestamp",
+    ], 5000);
+    const unit = parseSystemctlShow(out);
+    // `show` on a unit that doesn't exist still answers, with ActiveState=inactive. That is
+    // "serve runs some other way", not "serve is down".
+    if (unit.loadState === "not-found") throw new Error(`${SERVE_UNIT} not found`);
+    serveUnit = { ...unit, probedAt: Date.now() };
+    unitError = null;
+  } catch (err) {
+    serveUnit = null;
+    unitError = err.message;
+  }
+}
+
+/** Re-asks `--version` only when the symlink now points somewhere else. */
+async function probeInstalled({ force = false } = {}) {
+  let real = CODEXBAR_BIN;
+  try { real = await fs.realpath(CODEXBAR_BIN); } catch { /* bare name on PATH */ }
+  if (!force && installed.path === real && installed.version) return;
+  try {
+    const out = await run(CODEXBAR_BIN, ["--version"], 10_000);
+    installed = { version: parseVersion(out)?.join(".") ?? out.trim(), path: real, error: null };
+  } catch (err) {
+    installed = { version: null, path: real, error: err.message };
+  }
+}
+
+async function checkRelease() {
+  const checkedAt = new Date().toISOString();
+  try {
+    const res = await fetch(`https://api.github.com/repos/${RELEASE_REPO}/releases/latest`, {
+      headers: { Accept: "application/vnd.github+json", "User-Agent": "codexbar-tailnet" },
+      signal: AbortSignal.timeout(15_000),
+    });
+    if (!res.ok) throw new Error(`GitHub ${res.status}`);
+    const r = await res.json();
+    latestRelease = {
+      tag: r.tag_name,
+      name: r.name ?? r.tag_name,
+      url: r.html_url,
+      publishedAt: r.published_at,
+      assets: (r.assets ?? []).map((a) => a.name),
+      checkedAt,
+    };
+  } catch (err) {
+    // Keep the last good answer; a flaky API shouldn't make "update available" flicker.
+    latestRelease = latestRelease?.tag ? { ...latestRelease, error: err.message } : { error: err.message, checkedAt };
+  }
+}
+
+function pushHealth(event, reason, since) {
+  console.log(`health: ${event}${reason ? ` (${reason})` : ""}`);
+  if (!vapidKeys || subscriptionStore.count() === 0) return;
+  const down = event === "down";
+  const lasted = since != null ? Math.round((Date.now() - since) / 60_000) : null;
+  deliverToAll({
+    title: down ? "CodexBar serve is down" : "CodexBar serve is back",
+    body: down
+      ? `${reason}. The dashboard is showing old data.`
+      : `Answering again${lasted != null ? ` after ${lasted >= 60 ? `${Math.floor(lasted / 60)}h ${lasted % 60}m` : `${lasted}m`}` : ""}.`,
+    tag: "serve-health", // "back" replaces "down" instead of stacking under it
+    icon: "/icons/icon-192.png",
+    badge: "/icons/icon-192.png",
+    data: { url: "/", health: event },
+  }).catch((err) => console.warn("push: health delivery failed:", err.message));
+}
+
+async function sampleHealth() {
+  await probeUnit();
+  const since = monitor.degradedSince;
+  const { event, reason } = monitor.sample({ at: Date.now(), unit: serveUnit, upstream });
+  if (event) pushHealth(event, reason, since);
+}
+
+/** Everything the status pill and dialog show. Synchronous: it reads what the probes cached. */
+function statusBody() {
+  const now = Date.now();
+  // The monitor samples once a minute; a refresh that failed since then already counts.
+  const level = monitor.level === "ok" && upstream.down ? "warn" : monitor.level;
+  const latest = latestRelease?.tag ? latestRelease : null;
+  return {
+    generatedAt: iso(now),
+    health: { level, reason: monitor.reason ?? (upstream.down ? `serve isn't answering (${upstream.lastError})` : null), since: iso(monitor.degradedSince ?? upstream.downSince) },
+    upstream: upstream.toJSON(),
+    snapshot: lastGood ? { at: iso(lastGood.at), ageSeconds: Math.round((now - lastGood.at) / 1000) } : null,
+    serve: serveUnit
+      ? {
+        unit: SERVE_UNIT,
+        activeState: serveUnit.activeState,
+        subState: serveUnit.subState,
+        result: serveUnit.result,
+        restarts: serveUnit.restarts,
+        mainPid: serveUnit.mainPid,
+        activeSince: iso(serveUnit.activeSince),
+        uptimeSeconds: serveUnit.activeState === "active" && serveUnit.activeSince ? Math.round((now - serveUnit.activeSince) / 1000) : null,
+      }
+      : { unit: SERVE_UNIT, error: unitError },
+    codexbar: {
+      version: installed.version,
+      path: installed.path,
+      error: installed.error,
+      latest: latestRelease && (({ assets, ...rest }) => rest)(latestRelease), // assets are the updater's business
+      updateAvailable: !!(latest && installed.version && compareVersions(latest.tag, installed.version) > 0),
+    },
+    proxy: { startedAt: iso(STARTED_AT), uptimeSeconds: Math.round((now - STARTED_AT) / 1000) },
+  };
+}
+
+await Promise.all([sampleHealth(), probeInstalled()]);
+setInterval(() => { sampleHealth().catch(() => {}); }, STATUS_PROBE_MS).unref?.();
+if (RELEASE_CHECK_MS > 0) {
+  checkRelease();
+  setInterval(checkRelease, RELEASE_CHECK_MS).unref?.();
+}
+
 // Nothing in an inlined document can close the tag that carries it. CSS and JS never
 // legitimately contain these sequences outside a string, where the escape is a no-op.
 const deTag = (s) => s.replace(/<\/(script|style)/gi, "<\\/$1");
@@ -614,6 +767,7 @@ function bootScript(snap, ver, vapidPub) {
     `"vapidPublicKey":${JSON.stringify(vapidPub ?? null)}`,
     `"pace":${paceBody()}`,
     `"upstream":${JSON.stringify(upstream.toJSON())}`,
+    `"status":${JSON.stringify(statusBody())}`,
   ];
   if (snap) {
     fields.push(
@@ -723,6 +877,17 @@ const server = http.createServer(async (req, res) => {
   if (urlPath === "/api/health") {
     res.writeHead(200, { "Content-Type": "application/json", "Cache-Control": "no-store" });
     res.end(JSON.stringify({ status: "ok", upstream: `${UPSTREAM_HOST}:${UPSTREAM_PORT}` }));
+    return;
+  }
+
+  if (urlPath === "/api/status") {
+    // The dialog is open and someone wants current numbers; the timer's copy can be a minute old.
+    if (!serveUnit || Date.now() - serveUnit.probedAt > 15_000) await probeUnit();
+    await probeInstalled();
+    const json = "application/json; charset=utf-8";
+    const body = JSON.stringify(statusBody());
+    sendBody(req, res, 200, { "Content-Type": json, "Cache-Control": "no-store" }, body,
+      shouldGzip(req, json, Buffer.byteLength(body)));
     return;
   }
 

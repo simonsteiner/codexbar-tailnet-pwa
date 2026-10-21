@@ -110,6 +110,27 @@ to 5 min — every caller (clients, poller, push and history timers) shares one 
 crash-looping serve isn't hit on every 4 s re-poll. Tapping refresh retries immediately
 (`/api/snapshot?retry=1`). `X-Snapshot-Refreshing` is only ever true while a fetch is in flight.
 
+## Status light
+
+The dot by the title is a health light: brand colours when fine, amber while serve is failing,
+red (pulsing) once it has been degraded for `CBT_DOWN_ALERT` seconds. Tapping the title opens a
+status dialog — serve's unit state, uptime and restart count, when the last snapshot landed and
+the last error, the installed `codexbar` version against the latest upstream release, and the
+proxy's uptime. An **Update** pill appears next to the title when a newer release is out.
+
+`/api/status` is the JSON behind it. Once a minute the proxy samples `systemctl --user show` for
+serve's unit and its own fetch results; degraded means any of:
+
+- **crash loop** — `NRestarts` up by 3+ within 10 minutes. Between crashes the unit reads
+  `activating (auto-restart)` and the port even answers, so the counter is the only reliable sign;
+- **unit stopped** — `inactive` or `failed`;
+- **not answering** — the proxy's own refreshes are failing.
+
+Push subscribers get one "CodexBar serve is down" notice after `CBT_DOWN_ALERT` seconds of that,
+and a "back" notice (same tag, so it replaces the first) on recovery. The release check asks
+GitHub's unauthenticated API every `CBT_RELEASE_CHECK` hours and keeps its last good answer when
+GitHub is unreachable.
+
 ## Why a proxy instead of pointing the phone at `codexbar serve`
 
 Three concrete blockers, all handled here:
@@ -195,6 +216,10 @@ Read from `~/.config/codexbar/dashboard.env` (mode 600):
 | `CBT_VAPID_SUBJECT` | `mailto:codexbar@local` | Subject URI in VAPID JWT claims |
 | `CBT_PUSH_MIN_USED` | `10` | Skip the renewal push for windows whose usage stayed below this percent (1–100) |
 | `CBT_PUSH_TTL` | `3600` | Seconds the push service may hold an undelivered renewal notice (integer ≥ 0) |
+| `CBT_SERVE_UNIT` | `codexbar-serve.service` | User unit the status light watches (`systemctl --user show`) |
+| `CBT_DOWN_ALERT` | `600` | Push "serve is down" after this many seconds degraded, and "back" on recovery; `0` = no pushes |
+| `CBT_RELEASE_REPO` | `steipete/CodexBar` | Where "update available" is checked |
+| `CBT_RELEASE_CHECK` | `6` | Hours between release checks (unauthenticated GitHub API); `0` turns it off |
 
 Snapshot serving is stale-while-revalidate: a request never waits on a live provider
 fetch when any cached copy exists — it gets the cached body plus `X-Snapshot-Refreshing: true`,

@@ -30,6 +30,12 @@ const el = {
   notifyToggle: document.getElementById("notify-toggle"),
   notifyTest: document.getElementById("notify-test"),
   notifyInfo: document.getElementById("notify-info"),
+  healthBtn: document.getElementById("health"),
+  healthDot: document.getElementById("health-dot"),
+  updatePill: document.getElementById("update-pill"),
+  healthDialog: document.getElementById("health-dialog"),
+  healthClose: document.getElementById("health-close"),
+  healthInfo: document.getElementById("health-info"),
 };
 
 let snapshot = null;
@@ -40,6 +46,8 @@ let recheck = null;
 let updating = false;
 let shellStamp = null;
 let cost = null;
+/** Whether the last snapshot response said serve is down; a change re-asks `/api/status`. */
+let outageShown = boot?.upstream ? !boot.upstream.ok : false;
 /** Per-window pace from the proxy's usage history (`/api/pace`), keyed `provider::kind`. */
 let pace = boot?.pace ?? null;
 let costLoading = false;
@@ -71,7 +79,7 @@ function outageText({ downSince, error, ageSeconds, retryIn }) {
   const since = downSince ? ` since ${clock(downSince)}` : "";
   const why = error ? ` (${error})` : "";
   const age = ageSeconds > 0 ? ` Showing data from ${span(ageSeconds * 1000)} ago.` : "";
-  const next = retryIn > 0 ? ` Retrying in ${span(retryIn * 1000)}.` : " Retrying…";
+  const next = retryIn > 0 ? ` Retrying in ${retryIn < 60 ? `${retryIn}s` : span(retryIn * 1000)}.` : " Retrying…";
   return `CodexBar serve isn't answering${since}${why}.${age}${next}`;
 }
 
@@ -629,6 +637,7 @@ async function load({ retry = false } = {}) {
     else if (outage) scheduleRecheck(outage.retryIn * 1000 + 1000);
     if (outage) show(outageText(outage), true);
     else hide();
+    noteOutage(!!outage);
     render();
   } catch (err) {
     // Offline or the box is down: fall back to whatever we last saw.
@@ -639,6 +648,7 @@ async function load({ retry = false } = {}) {
       else el.content.innerHTML = `<p class="empty">No snapshot yet.</p>`;
     }
     if (err.outage) {
+      noteOutage(true);
       show(err.message, true);
       scheduleRecheck(err.outage.retryIn * 1000 + 1000);
     } else show(`Can't reach CodexBar (${err.message}). Is Tailscale connected?`, true);
@@ -716,6 +726,84 @@ async function loadVersion() {
   } catch { /* offline — whatever we cached stands */ }
 }
 
+/* ---------------- service status ---------------- */
+
+/** `/api/status`: serve's unit, the proxy's view of it, and whether a newer CodexBar is out. */
+let status = boot?.status ?? null;
+
+const extLink = (href, text) => `<a href="${esc(href)}" target="_blank" rel="noopener noreferrer">${esc(text)}</a>`;
+
+function healthRows(s) {
+  if (!s) return `<dt>Health</dt><dd>Unknown — the proxy hasn't answered yet.</dd>`;
+  const rows = [];
+  const h = s.health;
+  rows.push(["Health", h.level === "ok"
+    ? `<span class="t-ok">All good</span>`
+    : `<span class="${h.level === "down" ? "t-crit" : "t-warn"}">${esc(h.reason)}</span>${h.since ? ` · since ${esc(clock(h.since))}` : ""}`]);
+
+  const u = s.serve;
+  if (u?.error) rows.push(["Serve", `<span class="t-warn">${esc(u.error)}</span>`]);
+  else if (u) {
+    const state = u.activeState === "active"
+      ? `running${u.uptimeSeconds != null ? ` · up ${span(u.uptimeSeconds * 1000)}` : ""}`
+      : `${u.activeState}${u.subState ? ` (${u.subState})` : ""}`;
+    rows.push(["Serve", `${esc(state)} · ${u.restarts} restart${u.restarts === 1 ? "" : "s"}`]);
+  }
+
+  const snap = s.snapshot ? `fetched ${clock(s.snapshot.at)} (${span(s.snapshot.ageSeconds * 1000)} ago)` : "none yet";
+  const lastTry = s.upstream && !s.upstream.ok
+    ? `<br><span class="t-warn">last try ${esc(clock(s.upstream.lastErrorAt))}: ${esc(s.upstream.lastError)}</span>`
+    : "";
+  rows.push(["Snapshot", esc(snap) + lastTry]);
+
+  const c = s.codexbar;
+  let cb = c.version ? esc(c.version) : `<span class="t-warn">${esc(c.error ?? "unknown")}</span>`;
+  if (c.latest?.tag) {
+    cb += c.updateAvailable
+      ? ` · <span class="t-warn">${extLink(c.latest.url, `${c.latest.tag} available`)}</span>`
+      : ` · up to date`;
+  }
+  if (c.latest?.error) cb += `<br><span class="t-warn">release check failed: ${esc(c.latest.error)}</span>`;
+  rows.push(["CodexBar", cb]);
+  rows.push(["Proxy", `up ${esc(span(s.proxy.uptimeSeconds * 1000))}`]);
+  return rows.map(([k, v]) => `<dt>${k}</dt><dd>${v}</dd>`).join("");
+}
+
+function renderHealth() {
+  const level = status?.health?.level ?? "ok";
+  el.healthDot?.classList.toggle("warn", level === "warn");
+  el.healthDot?.classList.toggle("down", level === "down");
+  if (el.healthBtn) el.healthBtn.title = status?.health?.reason ?? "Service status";
+  if (el.updatePill) el.updatePill.hidden = !status?.codexbar?.updateAvailable;
+  if (el.healthDialog?.open) el.healthInfo.innerHTML = healthRows(status);
+}
+
+async function loadStatus() {
+  try {
+    const res = await fetch("/api/status", { cache: "no-store" });
+    if (!res.ok) return;
+    status = await res.json();
+    renderHealth();
+  } catch { /* offline — the snapshot banner already says so */ }
+}
+
+/** The light should follow the banner without waiting out the status poll. */
+function noteOutage(down) {
+  if (down === outageShown) return;
+  outageShown = down;
+  loadStatus();
+}
+
+el.healthBtn?.addEventListener("click", () => {
+  el.healthInfo.innerHTML = healthRows(status);
+  el.healthDialog?.showModal();
+  loadStatus();
+});
+el.healthClose?.addEventListener("click", () => el.healthDialog?.close());
+el.healthDialog?.addEventListener("click", (e) => {
+  if (e.target === el.healthDialog) el.healthDialog.close();
+});
+
 function setView(next) {
   view = next;
   localStorage.setItem(VIEW_KEY, next);
@@ -738,6 +826,7 @@ document.addEventListener("visibilitychange", () => {
   load();
   maybeLoadCost();
   loadVersion();
+  loadStatus();
 });
 
 /* ---------------- push notifications ---------------- */
@@ -973,7 +1062,9 @@ if (boot?.upstream && !boot.upstream.ok) {
   }), true);
 }
 
+renderHealth();
 setTimeout(loadVersion, 2000);
+setTimeout(loadStatus, 2000);
 // A hidden window still ticks about once a minute, and every tick keeps the proxy's poller
 // fetching providers, which is how a minimised PWA got Claude's OAuth endpoint rate limited.
 // Coming back into view reloads anyway (the visibilitychange handler).
@@ -981,6 +1072,7 @@ setInterval(() => {
   if (document.hidden) return;
   load();
   maybeLoadCost();
+  loadStatus();
 }, REFRESH_MS);
 ticking = setInterval(render, 30_000);
 

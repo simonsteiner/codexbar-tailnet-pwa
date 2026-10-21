@@ -1,4 +1,7 @@
-import { UpstreamHealth, retryDelay, RETRY_BASE_MS, RETRY_MAX_MS } from "./health.mjs";
+import {
+  UpstreamHealth, retryDelay, RETRY_BASE_MS, RETRY_MAX_MS,
+  ServeMonitor, parseSystemctlShow, parseVersion, compareVersions,
+} from "./health.mjs";
 import assert from "node:assert";
 import http from "node:http";
 import fs from "node:fs/promises";
@@ -58,7 +61,81 @@ async function runTests() {
     console.log("✓ Test 2 passed: outage bookkeeping");
   }
 
-  // 3: end to end — a serve that dies is reported as down, not "refreshing", and is not hammered
+  // 3: versions — tags, CLI output and install dir names all compare
+  {
+    assert.deepStrictEqual(parseVersion("CodexBar 0.79.0\n"), [0, 79, 0]);
+    assert.deepStrictEqual(parseVersion("0.78.0-musl"), [0, 78, 0]);
+    assert.strictEqual(parseVersion("nightly"), null);
+    assert.ok(compareVersions("v0.80.0", "0.79.0") > 0);
+    assert.ok(compareVersions("v0.79.0", "0.79.0") === 0);
+    assert.ok(compareVersions("v0.9.0", "0.10.0") < 0, "numeric, not lexical");
+    console.log("✓ Test 3 passed: version compare");
+  }
+
+  // 4: systemctl show, as the proxy asks for it
+  {
+    const u = parseSystemctlShow("LoadState=loaded\nActiveState=active\nSubState=running\nResult=success\nNRestarts=141\nMainPID=2574974\nActiveEnterTimestamp=@1792574652\n");
+    assert.deepStrictEqual(u, {
+      loadState: "loaded", activeState: "active", subState: "running", result: "success",
+      restarts: 141, mainPid: 2574974, activeSince: 1792574652000,
+    });
+    assert.strictEqual(parseSystemctlShow("ActiveEnterTimestamp=\nMainPID=0").activeSince, null);
+    assert.strictEqual(parseSystemctlShow("MainPID=0").mainPid, null);
+    console.log("✓ Test 4 passed: systemctl show parsing");
+  }
+
+  // 5: monitor — a crash loop alerts once after the grace period, then recovers once
+  {
+    const MIN = 60_000;
+    const m = new ServeMonitor({ alertAfterMs: 10 * MIN });
+    const up = new UpstreamHealth();
+    const unit = (restarts, activeState = "active") => ({ activeState, restarts, result: "success" });
+    assert.strictEqual(m.sample({ at: T0, unit: unit(0), upstream: up }).level, "ok");
+    // 2026-10-21: serve restarting every ~10 s, reading "activating" between crashes
+    const loop = m.sample({ at: T0 + MIN, unit: unit(6, "activating"), upstream: up });
+    assert.strictEqual(loop.level, "warn");
+    assert.match(loop.reason, /crash-looping: 6 restarts/);
+    assert.strictEqual(loop.event, null, "not before the grace period");
+    const down = m.sample({ at: T0 + 11 * MIN, unit: unit(60), upstream: up });
+    assert.strictEqual(down.level, "down");
+    assert.strictEqual(down.event, "down");
+    assert.strictEqual(m.sample({ at: T0 + 12 * MIN, unit: unit(66), upstream: up }).event, null, "alerts once");
+    // Restarts stop; the loop window still remembers them until they age out.
+    assert.strictEqual(m.sample({ at: T0 + 20 * MIN, unit: unit(66), upstream: up }).level, "down");
+    const back = m.sample({ at: T0 + 23 * MIN, unit: unit(66), upstream: up });
+    assert.strictEqual(back.level, "ok");
+    assert.strictEqual(back.event, "recovered");
+    console.log("✓ Test 5 passed: crash loop alert and recovery");
+  }
+
+  // 6: monitor — a stopped unit and a dead port count; one restart and a quiet window don't
+  {
+    const MIN = 60_000;
+    const m = new ServeMonitor({ alertAfterMs: 5 * MIN });
+    const up = new UpstreamHealth();
+    assert.strictEqual(m.sample({ at: T0, unit: { activeState: "active", restarts: 0 }, upstream: up }).level, "ok");
+    assert.strictEqual(m.sample({ at: T0 + MIN, unit: { activeState: "active", restarts: 1 }, upstream: up }).level, "ok");
+    const stopped = m.sample({ at: T0 + 2 * MIN, unit: { activeState: "failed", result: "signal", restarts: 1 }, upstream: up });
+    assert.match(stopped.reason, /serve unit is failed \(signal\)/);
+
+    const m2 = new ServeMonitor({ alertAfterMs: 5 * MIN });
+    const up2 = new UpstreamHealth();
+    up2.fail(new Error("upstream timeout"), T0);
+    m2.quiet(T0 + 30 * MIN);
+    const r = m2.sample({ at: T0 + 6 * MIN, unit: null, upstream: up2 });
+    assert.strictEqual(r.level, "down", "measured from the outage start, not the first sample");
+    assert.match(r.reason, /isn't answering \(upstream timeout\)/);
+    assert.strictEqual(r.event, null, "quiet: an update is restarting serve");
+
+    const silent = new ServeMonitor({ alertAfterMs: 5 * MIN, notify: false });
+    const up3 = new UpstreamHealth();
+    up3.fail(new Error("x"), T0);
+    assert.strictEqual(silent.sample({ at: T0 + 6 * MIN, unit: null, upstream: up3 }).event, null);
+    assert.strictEqual(silent.level, "down");
+    console.log("✓ Test 6 passed: unit state, quiet window, notify off");
+  }
+
+  // 7: end to end — a serve that dies is reported as down, not "refreshing", and is not hammered
   {
     let mode = "ok";
     let hits = 0;
@@ -83,6 +160,9 @@ async function runTests() {
         CBT_CONFIG_DIR: dir,
         CBT_CACHE_TTL: "0",
         CBT_HISTORY_POLL: "0",
+        CBT_RELEASE_CHECK: "0",
+        CBT_SERVE_UNIT: "cbt-test-does-not-exist.service",
+        CBT_CODEXBAR_BIN: "/bin/false",
       },
       stdio: ["ignore", "pipe", "pipe"],
     });
@@ -128,7 +208,15 @@ async function runTests() {
       await waitFor(async () => (await get(port, "/api/snapshot")).headers.get("x-snapshot-stale") === "true");
       const page = await get(port, "/");
       assert.match(page.body, /"upstream":\{"ok":false/);
-      console.log("✓ Test 3 passed: dead upstream reported, backed off, recovered");
+
+      const st = JSON.parse((await get(port, "/api/status")).body);
+      assert.strictEqual(st.health.level, "warn");
+      assert.match(st.health.reason, /isn't answering/);
+      assert.match(st.serve.error, /not found/, "a missing unit is unknown, not down");
+      assert.strictEqual(st.codexbar.version, null);
+      assert.strictEqual(st.codexbar.updateAvailable, false);
+      assert.ok(st.snapshot.at);
+      console.log("✓ Test 7 passed: dead upstream reported, backed off, recovered; /api/status");
     } finally {
       // It saves its state on SIGTERM; let that finish before the directory goes.
       await new Promise((r) => { child.once("exit", r); child.kill(); });
