@@ -1,4 +1,4 @@
-import { Updater, parseSha256File, unsafeTarEntry, missingLibraries, assetName, linuxArch } from "./updater.mjs";
+import { Updater, parseSha256File, unsafeTarEntry, missingLibraries, assetName, linuxArch, pruneCandidates } from "./updater.mjs";
 import assert from "node:assert";
 import fs from "node:fs/promises";
 import os from "node:os";
@@ -60,6 +60,17 @@ async function runTests() {
     assert.deepStrictEqual(missingLibraries("\tlinux-vdso.so.1 (0x1)\n\tlibxml2.so.2 => not found\n\tlibc.so.6 => /lib/libc.so.6 (0x2)\n"), ["libxml2.so.2"]);
     assert.deepStrictEqual(missingLibraries("\tnot a dynamic executable\n"), []);
     console.log("✓ Test 1 passed: sha256 files, tar listings, ldd output");
+  }
+
+  // 1b: pruning keeps the active install, the one it replaced, and the newest `keep` glibc builds
+  {
+    const i = (name, extra = {}) => ({ name, musl: /musl/.test(name), current: false, ...extra });
+    const installs = [i("0.80.0", { current: true }), i("0.79.0-musl"), i("0.79.0"), i("0.78.0-musl"), i("0.77.0"), i("0.76.0"), i("0.70.0")];
+    assert.deepStrictEqual(pruneCandidates(installs, { keep: 2, previous: "0.79.0" }), ["0.79.0-musl", "0.78.0-musl", "0.70.0"]);
+    // Coming from a musl build: it is still kept, as the one rollback that is known to be what ran
+    assert.deepStrictEqual(pruneCandidates(installs, { keep: 1, previous: "0.79.0-musl" }), ["0.78.0-musl", "0.77.0", "0.76.0", "0.70.0"]);
+    assert.deepStrictEqual(pruneCandidates(installs, { keep: 0, previous: "0.79.0" }), []);
+    console.log("✓ Test 1b passed: prune selection");
   }
 
   // 2-7: the whole flow, against a fake install root, fake GitHub and a fake systemd
@@ -206,6 +217,32 @@ esac
       assert.match(await active(), /^0\.2\.0-\d{8}-\d{6}$/);
       await fs.access(path.join(root, "0.2.0", "CodexBarCLI"));
       console.log("✓ Test 7 passed: existing install dirs are never overwritten");
+    }
+
+    // 8: a successful update prunes; the stray `current` symlink and hidden dirs are left alone
+    {
+      for (const name of ["0.0.1", "0.0.2-musl", "0.0.3"]) {
+        await fs.mkdir(path.join(root, name));
+        await fs.writeFile(path.join(root, name, "CodexBarCLI"), "", { mode: 0o755 });
+      }
+      await fs.mkdir(path.join(root, ".someone-elses"));
+      const replaced = await active();
+      publish(await makeRelease(dir, "0.7.0"));
+      u.keep = 1;
+      await u.startUpdate("v0.7.0");
+      const job = await finished();
+      assert.strictEqual(job.state, "succeeded", job.error);
+      const left = (await fs.readdir(root)).sort();
+      assert.deepStrictEqual(left, [".someone-elses", "0.3.0", "0.7.0", replaced, "current"].sort());
+      assert.ok(job.log.some((l) => /removed old installs: .*0\.0\.2-musl/.test(l.msg)));
+
+      // A failed update prunes nothing.
+      await fs.mkdir(path.join(root, "0.0.4"));
+      await fs.writeFile(path.join(root, "0.0.4", "CodexBarCLI"), "", { mode: 0o755 });
+      await u.startUpdate("v0.4.0"); // the smoke-test segfault
+      assert.strictEqual((await finished()).state, "failed");
+      await fs.access(path.join(root, "0.0.4", "CodexBarCLI"));
+      console.log("✓ Test 8 passed: prune after a good update only");
     }
   } finally {
     await fs.rm(dir, { recursive: true, force: true });

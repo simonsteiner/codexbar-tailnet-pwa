@@ -4,8 +4,10 @@
 // learned the hard way: verify the checksum, refuse a binary with unresolved libraries
 // (0.78.0's libxml2.so.2), run a *cold* cost scan before trusting it (0.78.0-musl segfaulted
 // there and crash-looped serve for 11 hours), and put the previous binary back on its own
-// when serve doesn't come up healthy. Nothing is ever deleted except this module's own
-// download and staging directories; every install stays in the install root as a rollback.
+// when serve doesn't come up healthy. A successful update then prunes old installs down to the
+// active one, the one it replaced, and the newest `keep` other glibc builds; musl builds count as
+// nothing worth rolling back to. Failed or rolled-back jobs delete nothing but their own
+// download and staging directories.
 
 import fs from "node:fs/promises";
 import { createWriteStream } from "node:fs";
@@ -26,6 +28,17 @@ const SMOKE_TIMEOUT_MS = 5 * 60_000;
 const SETTLE_MS = 60_000;
 const VERIFY_TIMEOUT_MS = 3 * 60_000;
 const LOG_LINES = 60;
+
+/**
+ * Which installs a prune removes: everything except the active one, the one just replaced, and
+ * the newest `keep` other glibc builds. `keep` 0 = prune nothing. Pure, for the tests.
+ */
+export function pruneCandidates(installs, { keep, previous }) {
+  if (!(keep > 0)) return [];
+  const spare = installs.filter((i) => !i.current && i.name !== previous && !i.musl);
+  const kept = new Set(spare.slice(0, keep).map((i) => i.name)); // installs() is newest first
+  return installs.filter((i) => !i.current && i.name !== previous && !kept.has(i.name)).map((i) => i.name);
+}
 
 export const linuxArch = (nodeArch = os.arch()) => ({ x64: "x86_64", arm64: "aarch64" })[nodeArch] ?? null;
 
@@ -92,11 +105,12 @@ export class Updater {
    * @param {() => Promise<unknown>} o.verifyServe  one real snapshot fetch through serve
    * @param {(untilMs: number) => void} [o.quiet]   silence the down alert while serve restarts
    * @param {() => void} [o.onChange]               installed binary changed
+   * @param {number} [o.keep]  older glibc installs to keep after an update, besides the replaced one; 0 = never prune
    * (`fetch`, `systemctl`, `settleMs`, `verifyTimeoutMs` and `pollMs` exist for the tests.)
    */
   constructor(o) {
     Object.assign(this, {
-      variant: "", quiet: () => {}, onChange: () => {}, fetch: globalThis.fetch, systemctl: "systemctl",
+      variant: "", keep: 2, quiet: () => {}, onChange: () => {}, fetch: globalThis.fetch, systemctl: "systemctl",
       settleMs: SETTLE_MS, verifyTimeoutMs: VERIFY_TIMEOUT_MS, pollMs: 3000, ...o,
     });
     this.job = null;
@@ -217,6 +231,7 @@ export class Updater {
       staging = null;
       this.#log(job, `installed to ${dest}`);
       await this.#activate(job, dest, version, { smoked: true });
+      if (job.state === "running") await this.#prune(job);
     } finally {
       await fs.rm(work, { recursive: true, force: true });
       if (staging) await fs.rm(staging, { recursive: true, force: true });
@@ -303,6 +318,22 @@ export class Updater {
       job.state = "rolled-back";
       job.error = err.message;
     }
+  }
+
+  /** Only after a good update, and only dirs `installs()` vouched for (real dirs with a CLI in them). */
+  async #prune(job) {
+    const removed = [];
+    for (const name of pruneCandidates(await this.installs(), { keep: this.keep, previous: job.from })) {
+      const dir = path.join(this.installRoot, name);
+      if (path.dirname(dir) !== path.resolve(this.installRoot)) continue;
+      try {
+        await fs.rm(dir, { recursive: true, force: true });
+        removed.push(name);
+      } catch (err) {
+        this.#log(job, `couldn't remove ${name}: ${err.message}`);
+      }
+    }
+    if (removed.length) this.#log(job, `removed old installs: ${removed.join(", ")}`);
   }
 
   /** Atomic: a new link renamed over the old one, so the CLI is never missing. */
