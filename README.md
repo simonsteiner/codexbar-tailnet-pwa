@@ -102,6 +102,14 @@ hung provider probe under `serve` can otherwise freeze every row behind plausibl
 an idle spell the badges also show briefly while the first refresh is still in flight, because
 that data really is old.
 
+When `serve` itself stops answering (crashing, hung, stopped), the proxy keeps serving the last
+good snapshot but marks it `X-Snapshot-Stale: true` with `X-Snapshot-Error`,
+`X-Upstream-Down-Since` and `X-Upstream-Retry-In`, and the app shows a red banner: *serve isn't
+answering since 00:21 (socket hang up). Showing data from 11h ago.* Retries back off from 10 s
+to 5 min — every caller (clients, poller, push and history timers) shares one schedule, so a
+crash-looping serve isn't hit on every 4 s re-poll. Tapping refresh retries immediately
+(`/api/snapshot?retry=1`). `X-Snapshot-Refreshing` is only ever true while a fetch is in flight.
+
 ## Why a proxy instead of pointing the phone at `codexbar serve`
 
 Three concrete blockers, all handled here:

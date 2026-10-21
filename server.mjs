@@ -30,6 +30,7 @@ import {
   DEFAULT_PUSH_TTL_SECONDS,
 } from "./push.mjs";
 import { UsageHistory } from "./history.mjs";
+import { UpstreamHealth } from "./health.mjs";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const PUBLIC_DIR = path.join(HERE, "public");
@@ -347,6 +348,7 @@ let lastGood = null;
 let inFlight = null;
 /** The newest snapshot, parsed: what pace is reported against. */
 let latestSnapshot = null;
+const upstream = new UpstreamHealth();
 
 function fetchUpstream(upstreamPath) {
   return new Promise((resolve, reject) => {
@@ -386,10 +388,19 @@ function fetchUpstream(upstreamPath) {
 const fetchSnapshot = () => fetchUpstream("/dashboard/v1/snapshot");
 
 // Coalesce concurrent refreshes into one upstream call, mirroring what `serve` does internally.
-function refresh() {
+// While serve is failing, calls inside the backoff are refused without touching it — every
+// caller (clients, poller, push timer, history poll) goes through here. `force` is the user
+// tapping refresh, which is allowed to jump the queue.
+function refresh({ force = false } = {}) {
   if (!inFlight) {
+    const wait = upstream.retryIn();
+    if (wait > 0 && !force) {
+      return Promise.reject(new Error(`upstream down (${upstream.lastError}); next try in ${Math.ceil(wait / 1000)}s`));
+    }
     inFlight = fetchSnapshot()
       .then((fresh) => {
+        const outage = upstream.ok(fresh.at);
+        if (outage != null) console.log(`upstream: back after ${Math.round(outage / 1000)}s down`);
         cache = fresh;
         lastGood = fresh;
         try {
@@ -400,6 +411,9 @@ function refresh() {
           learnDurations(parsed);
         } catch { /* json parse error */ }
         return fresh;
+      }, (err) => {
+        if (upstream.fail(err)) console.warn(`upstream: down (${err.message})`);
+        throw err;
       })
       .finally(() => {
         inFlight = null;
@@ -410,13 +424,15 @@ function refresh() {
 
 // Stale-while-revalidate: never make a phone wait out a live provider fetch when we
 // have anything at all to show. A stale hit answers immediately, marks itself
-// `refreshing`, and the client re-polls until the background refresh lands.
-async function getSnapshot() {
+// `refreshing`, and the client re-polls until the background refresh lands. `refreshing`
+// means a fetch really is in flight: a refresh refused by the backoff is not one, and saying
+// otherwise is what kept the phone spinning all night.
+async function getSnapshot({ force = false } = {}) {
   if (cache && Date.now() - cache.at < CACHE_TTL_MS) return { ...cache, cached: true, refreshing: false };
-  const pending = refresh();
+  const pending = refresh({ force });
   if (cache) {
-    pending.catch(() => {}); // background failure falls back to lastGood on a later miss
-    return { ...cache, cached: true, refreshing: true };
+    pending.catch(() => {}); // the failure is in `upstream`, reported with the stale body
+    return { ...cache, cached: true, refreshing: !!inFlight };
   }
   // Cold boot with nothing cached: waiting is all we can do.
   return { ...(await pending), cached: false, refreshing: false };
@@ -597,6 +613,7 @@ function bootScript(snap, ver, vapidPub) {
     `"version":${JSON.stringify(ver)}`,
     `"vapidPublicKey":${JSON.stringify(vapidPub ?? null)}`,
     `"pace":${paceBody()}`,
+    `"upstream":${JSON.stringify(upstream.toJSON())}`,
   ];
   if (snap) {
     fields.push(
@@ -686,6 +703,18 @@ async function serveStatic(req, res, urlPath) {
   } catch {
     res.writeHead(404, { "Content-Type": "text/plain" }).end("not found");
   }
+}
+
+// What the phone needs to say "serve has been down since 00:21" instead of spinning: set
+// whenever the last refresh failed, even if a retry is already in flight.
+function upstreamHeaders(err) {
+  if (!upstream.down && !err) return {};
+  return {
+    "X-Snapshot-Stale": "true",
+    "X-Snapshot-Error": String(upstream.lastError ?? err?.message ?? "").replace(/[^\x20-\x7e]/g, "?").slice(0, 200),
+    ...(upstream.downSince ? { "X-Upstream-Down-Since": new Date(upstream.downSince).toISOString() } : {}),
+    "X-Upstream-Retry-In": String(Math.ceil(upstream.retryIn() / 1000)),
+  };
 }
 
 const server = http.createServer(async (req, res) => {
@@ -779,14 +808,16 @@ const server = http.createServer(async (req, res) => {
   if (urlPath === "/api/snapshot") {
     lastClientAt = Date.now();
     const json = "application/json; charset=utf-8";
+    const force = new URLSearchParams((req.url ?? "").split("?")[1] ?? "").has("retry");
     try {
-      const snap = await getSnapshot();
+      const snap = await getSnapshot({ force });
       sendBody(req, res, 200, {
         "Content-Type": json,
         "Cache-Control": "no-store",
         "X-Snapshot-Cached": String(snap.cached),
         "X-Snapshot-Refreshing": String(snap.refreshing),
         "X-Snapshot-Age": String(Math.round((Date.now() - snap.at) / 1000)),
+        ...upstreamHeaders(),
       }, snap.body, shouldGzip(req, json, Buffer.byteLength(snap.body)));
     } catch (err) {
       // Fall back to the last good snapshot so a single slow provider doesn't blank the phone.
@@ -794,13 +825,14 @@ const server = http.createServer(async (req, res) => {
         sendBody(req, res, 200, {
           "Content-Type": json,
           "Cache-Control": "no-store",
-          "X-Snapshot-Stale": "true",
-          "X-Snapshot-Error": String(err.message).slice(0, 200),
+          "X-Snapshot-Refreshing": "false",
+          "X-Snapshot-Age": String(Math.round((Date.now() - lastGood.at) / 1000)),
+          ...upstreamHeaders(err),
         }, lastGood.body, shouldGzip(req, json, Buffer.byteLength(lastGood.body)));
         return;
       }
-      res.writeHead(502, { "Content-Type": "application/json", "Cache-Control": "no-store" });
-      res.end(JSON.stringify({ error: "upstream_unavailable", detail: String(err.message) }));
+      res.writeHead(502, { "Content-Type": "application/json", "Cache-Control": "no-store", ...upstreamHeaders(err) });
+      res.end(JSON.stringify({ error: "upstream_unavailable", detail: String(err.message), upstream: upstream.toJSON() }));
     }
     return;
   }

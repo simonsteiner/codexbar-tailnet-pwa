@@ -54,13 +54,25 @@ const spendSel = new Map();
 const syncSpinner = () => el.refresh?.classList.toggle("spinning", loading || updating || costLoading);
 
 // The proxy answers stale hits instantly and refreshes in the background
-// (X-Snapshot-Refreshing). Re-poll on a short fuse until the fresh data lands.
-function scheduleRecheck() {
+// (X-Snapshot-Refreshing). Re-poll on a short fuse until the fresh data lands — but while
+// serve is down, only when the proxy says its next attempt is due (X-Upstream-Retry-In).
+function scheduleRecheck(delayMs = 4000) {
   if (recheck) return;
   recheck = setTimeout(() => {
     recheck = null;
     load();
-  }, 4000);
+  }, Math.min(Math.max(delayMs, 4000), 120_000));
+}
+
+const clock = (t) => new Date(t).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+
+/** The banner for a proxy that has data but can't refresh it: says what, since when, and how old. */
+function outageText({ downSince, error, ageSeconds, retryIn }) {
+  const since = downSince ? ` since ${clock(downSince)}` : "";
+  const why = error ? ` (${error})` : "";
+  const age = ageSeconds > 0 ? ` Showing data from ${span(ageSeconds * 1000)} ago.` : "";
+  const next = retryIn > 0 ? ` Retrying in ${span(retryIn * 1000)}.` : " Retrying…";
+  return `CodexBar serve isn't answering${since}${why}.${age}${next}`;
 }
 
 /* ---------------- helpers ---------------- */
@@ -583,7 +595,7 @@ function render() {
   }
 }
 
-async function load() {
+async function load({ retry = false } = {}) {
   if (loading) return;
   loading = true;
   syncSpinner();
@@ -594,16 +606,29 @@ async function load() {
     .then((r) => (r.ok ? r.json() : null))
     .catch(() => null);
   try {
-    const res = await fetch("/api/snapshot", { cache: "no-store" });
+    const res = await fetch(retry ? "/api/snapshot?retry=1" : "/api/snapshot", { cache: "no-store" });
+    const h = (name) => res.headers.get(name);
+    const outage = h("X-Snapshot-Stale") === "true" ? {
+      downSince: h("X-Upstream-Down-Since"),
+      error: h("X-Snapshot-Error"),
+      ageSeconds: Number(h("X-Snapshot-Age")) || 0,
+      retryIn: Number(h("X-Upstream-Retry-In")) || 0,
+    } : null;
+    if (res.status === 502 && outage) {
+      // The proxy is up but has never had a snapshot to fall back on.
+      const err = new Error(outageText(outage));
+      err.outage = outage;
+      throw err;
+    }
     if (!res.ok) throw new Error(`snapshot ${res.status}`);
     snapshot = await res.json();
     pace = (await paceReq) ?? pace;
     localStorage.setItem(LAST_KEY, JSON.stringify(snapshot));
-    updating = res.headers.get("X-Snapshot-Refreshing") === "true";
+    updating = h("X-Snapshot-Refreshing") === "true";
     if (updating) scheduleRecheck();
-    if (res.headers.get("X-Snapshot-Stale") === "true") {
-      show("Showing last good data — the latest refresh failed.", false);
-    } else hide();
+    else if (outage) scheduleRecheck(outage.retryIn * 1000 + 1000);
+    if (outage) show(outageText(outage), true);
+    else hide();
     render();
   } catch (err) {
     // Offline or the box is down: fall back to whatever we last saw.
@@ -613,7 +638,10 @@ async function load() {
       if (snapshot) render();
       else el.content.innerHTML = `<p class="empty">No snapshot yet.</p>`;
     }
-    show(`Can't reach CodexBar (${err.message}). Is Tailscale connected?`, true);
+    if (err.outage) {
+      show(err.message, true);
+      scheduleRecheck(err.outage.retryIn * 1000 + 1000);
+    } else show(`Can't reach CodexBar (${err.message}). Is Tailscale connected?`, true);
   } finally {
     loading = false;
     syncSpinner();
@@ -702,7 +730,7 @@ for (const b of document.querySelectorAll(".view-btn")) {
   b.addEventListener("click", () => setView(b.dataset.view));
 }
 el.refresh?.addEventListener("click", () => {
-  load();
+  load({ retry: true });
   if (view === "spend") loadCost();
 });
 document.addEventListener("visibilitychange", () => {
@@ -935,6 +963,15 @@ const bootIsCurrent = snapshot === boot?.snapshot
   && !boot.refreshing
   && Date.now() - generatedMs(snapshot) < BOOT_FRESH_MS;
 if (!bootIsCurrent) load();
+// A page served mid-outage says so before its first fetch lands.
+if (boot?.upstream && !boot.upstream.ok) {
+  show(outageText({
+    downSince: boot.upstream.downSince,
+    error: boot.upstream.lastError,
+    ageSeconds: snapshot ? Math.round((Date.now() - generatedMs(snapshot)) / 1000) : 0,
+    retryIn: boot.upstream.retryInSeconds,
+  }), true);
+}
 
 setTimeout(loadVersion, 2000);
 // A hidden window still ticks about once a minute, and every tick keeps the proxy's poller
