@@ -45,7 +45,10 @@ let ticking = null;
 let loading = false;
 let recheck = null;
 let updating = false;
-let shellStamp = null;
+// The build this page was served as. It must come from the page itself: adopting whatever the
+// first /api/version says instead meant a page that booted from an old cached shell, and only
+// asked after the server had moved on, took the new stamp as its own and never reloaded.
+let shellStamp = boot?.version?.stamp ?? null;
 let cost = null;
 /** Whether the last snapshot response said serve is down; a change re-asks `/api/status`. */
 let outageShown = boot?.upstream ? !boot.upstream.ok : false;
@@ -717,6 +720,9 @@ async function loadVersion() {
     const v = await res.json();
     if (v.stamp) {
       if (shellStamp && v.stamp !== shellStamp) {
+        // Not out from under an open dialog (an update job's log, a half-made choice); the
+        // next check reloads once it is closed.
+        if (document.querySelector("dialog[open]")) return;
         location.reload();
         return;
       }
@@ -1163,6 +1169,9 @@ setInterval(() => {
   load();
   maybeLoadCost();
   loadStatus();
+  // A window that stays visible (a desktop PWA left open, a pinned tab) never fires
+  // visibilitychange, so it has to look for a new build on the timer too.
+  loadVersion();
 }, REFRESH_MS);
 ticking = setInterval(render, 30_000);
 

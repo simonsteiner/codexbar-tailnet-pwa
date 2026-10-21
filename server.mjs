@@ -831,7 +831,10 @@ async function readIndex() {
   const built = await buildShell();
   // Classic inline scripts run before deferred module scripts, so __BOOT__ is always
   // defined by the time app.js looks for it.
-  const script = bootScript(peekSnapshot(), await getVersion(), vapidKeys?.publicKey ?? null);
+  // The stamp of the shell actually being sent, not getVersion()'s (cached for 30 s): the page
+  // compares it to /api/version to notice it is running old JS.
+  const ver = { ...(await getVersion()), stamp: built.stamp };
+  const script = bootScript(peekSnapshot(), ver, vapidKeys?.publicKey ?? null);
   return built.html.replace("</head>", () => `${script}</head>`);
 }
 
