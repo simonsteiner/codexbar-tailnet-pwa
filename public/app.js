@@ -813,24 +813,27 @@ function healthActions(s) {
     const lines = job.log.map((l) => `<span class="log-at">${esc(clock(l.at))}</span><span>${esc(l.msg)}</span>`).join("");
     parts.push(`<pre class="job-log">${lines}</pre>`);
   }
-  if (!busy && s.codexbar.updateAvailable && latest?.tag) {
+  // While a job runs the controls stay, disabled, so the dialog doesn't grow under the log when
+  // it ends. Not the button for the very release being installed: that reads as "do it again".
+  const off = busy ? " disabled" : "";
+  if (s.codexbar.updateAvailable && latest?.tag && !(busy && job.target === latest.tag)) {
     // Just switched away from the latest on purpose: offer the way back, without the big button.
     const bare = (v) => String(v ?? "").replace(/^v/, "");
     const left = job?.action === "rollback" && job.state === "succeeded" && bare(job.from) === bare(latest.tag);
     parts.push(left
-      ? `<button class="btn btn-secondary" data-action="update" data-tag="${esc(latest.tag)}">Go back to ${esc(latest.tag)}</button>`
-      : `<button class="btn btn-primary" data-action="update" data-tag="${esc(latest.tag)}">Update to ${esc(latest.tag)}</button>`);
+      ? `<button class="btn btn-secondary" data-action="update" data-tag="${esc(latest.tag)}"${off}>Go back to ${esc(latest.tag)}</button>`
+      : `<button class="btn btn-primary" data-action="update" data-tag="${esc(latest.tag)}"${off}>Update to ${esc(latest.tag)}</button>`);
   }
   const others = (admin.installs ?? []).filter((i) => !i.current);
-  if (!busy && others.length) {
+  if (others.length) {
     // Preselect the newest glibc build: switching back is usually "the one before", and musl
     // builds are the ones known to crash serve (the smoke test would refuse them anyway).
     const pick = (others.find((i) => !i.musl) ?? others[0]).name;
     const opts = others.map((i) =>
       `<option value="${esc(i.name)}"${i.name === pick ? " selected" : ""}>${esc(i.name)}${i.musl ? " (musl)" : ""}</option>`).join("");
     parts.push(`<details><summary>Switch to an installed version</summary>
-      <div class="switch"><select id="rollback-to" aria-label="Installed version">${opts}</select>
-      <button class="btn btn-secondary" data-action="rollback">Switch</button></div></details>`);
+      <div class="switch"><select id="rollback-to" aria-label="Installed version"${off}>${opts}</select>
+      <button class="btn btn-secondary" data-action="rollback"${off}>Switch</button></div></details>`);
   }
   return parts.join("");
 }
