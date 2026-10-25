@@ -754,7 +754,9 @@ function healthRows(s) {
     const state = u.activeState === "active"
       ? `running${u.uptimeSeconds != null ? ` · up ${span(u.uptimeSeconds * 1000)}` : ""}`
       : `${u.activeState}${u.subState ? ` (${u.subState})` : ""}`;
-    rows.push(["Serve", `${esc(state)} · ${u.restarts} restart${u.restarts === 1 ? "" : "s"}`]);
+    // NRestarts only counts systemd's own restarts after a crash, not a deliberate restart.
+    const crashes = u.restarts > 0 ? ` · <span class="t-warn">${u.restarts} crash restart${u.restarts === 1 ? "" : "s"}</span>` : "";
+    rows.push(["Serve", esc(state) + crashes]);
   }
 
   const snap = s.snapshot ? `fetched ${clock(s.snapshot.at)} (${span(s.snapshot.ageSeconds * 1000)} ago)` : "none yet";

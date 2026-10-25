@@ -973,7 +973,8 @@ const server = http.createServer(async (req, res) => {
 
   if (urlPath === "/api/status") {
     // The dialog is open and someone wants current numbers; the timer's copy can be a minute old.
-    if (!serveUnit || Date.now() - serveUnit.probedAt > 15_000) await probeUnit();
+    // During an update serve restarts under the dialog, so every poll looks again.
+    if (!serveUnit || updater.busy || Date.now() - serveUnit.probedAt > 15_000) await probeUnit();
     await probeInstalled();
     const json = "application/json; charset=utf-8";
     const body = JSON.stringify({ ...statusBody(), admin: await adminStatus(req) });
