@@ -169,6 +169,12 @@ async function runTests() {
     assert.strictEqual(r["claude::session"].expectedUsedPercent, 40);
     assert.strictEqual(r["claude::session"].samples.length, 2);
     await fs.unlink(file).catch(() => {});
+
+    // A failed write keeps the readings pending instead of dropping them until the next one.
+    const lost = new UsageHistory(path.join(os.tmpdir(), `no-such-dir-${Date.now()}`, "h.json"));
+    lost.record(snap([win("session", 30, reset)]), T0 + HOUR);
+    await assert.rejects(lost.save());
+    assert.strictEqual(lost.dirty, true);
     console.log("✓ Test 11 passed: report and persistence");
   }
 

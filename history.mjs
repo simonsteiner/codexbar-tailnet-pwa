@@ -4,6 +4,7 @@
 // which has `windowMinutes` but is a full provider fetch, so it is asked rarely.
 
 import fs from "node:fs/promises";
+import { randomUUID } from "node:crypto";
 
 const MINUTE = 60_000;
 const HOUR = 60 * MINUTE;
@@ -161,9 +162,17 @@ export class UsageHistory {
       durations: Object.fromEntries(this.durations),
       series: Object.fromEntries(this.series),
     };
-    const tmp = `${this.filePath}.tmp`;
-    await fs.writeFile(tmp, JSON.stringify(data));
-    await fs.rename(tmp, this.filePath);
+    // Unique per call: the 5-minute save and the shutdown save can overlap, and two writers on
+    // one temp file can interleave into JSON that load() discards whole.
+    const tmp = `${this.filePath}.${randomUUID()}.tmp`;
+    try {
+      await fs.writeFile(tmp, JSON.stringify(data));
+      await fs.rename(tmp, this.filePath);
+    } catch (err) {
+      this.dirty = true; // still unsaved; the next save tries again
+      await fs.unlink(tmp).catch(() => {});
+      throw err;
+    }
   }
 
   /** Windows of `snapshot` this history tracks: top-level, non-idle provider windows. */
