@@ -813,7 +813,12 @@ function healthActions(s) {
     parts.push(`<pre class="job-log">${esc(lines)}</pre>`);
   }
   if (!busy && s.codexbar.updateAvailable && latest?.tag) {
-    parts.push(`<button class="btn btn-primary" data-action="update" data-tag="${esc(latest.tag)}">Update to ${esc(latest.tag)}</button>`);
+    // Just switched away from the latest on purpose: offer the way back, without the big button.
+    const bare = (v) => String(v ?? "").replace(/^v/, "");
+    const left = job?.action === "rollback" && job.state === "succeeded" && bare(job.from) === bare(latest.tag);
+    parts.push(left
+      ? `<button class="btn btn-secondary" data-action="update" data-tag="${esc(latest.tag)}">Go back to ${esc(latest.tag)}</button>`
+      : `<button class="btn btn-primary" data-action="update" data-tag="${esc(latest.tag)}">Update to ${esc(latest.tag)}</button>`);
   }
   const others = (admin.installs ?? []).filter((i) => !i.current);
   if (!busy && others.length) {
