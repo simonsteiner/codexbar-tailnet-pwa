@@ -224,6 +224,19 @@ function paceDetails(pc) {
   return `<p>${esc(parts.join(" \u00b7 "))}</p>`;
 }
 
+/** A window's start and reset as wall times; a weekday or date when it spans days. `start` needs a known length. */
+function windowTimes(pc, resetAt) {
+  // Providers report resets a few seconds off the minute (10:29:59); show 10:30.
+  const minute = (iso) => new Date(Math.round(Date.parse(iso) / 60_000) * 60_000);
+  const end = minute(resetAt ?? "");
+  if (Number.isNaN(end.getTime())) return null;
+  const start = pc?.startAt ? minute(pc.startAt) : null;
+  const len = Math.max(start ? end - start : 0, end - Date.now());
+  const day = len > 7 * 86_400_000 ? { day: "numeric", month: "short" } : len > 86_400_000 ? { weekday: "short" } : {};
+  const fmt = (d) => d.toLocaleString([], { ...day, hour: "2-digit", minute: "2-digit" });
+  return { start: start ? fmt(start) : null, end: fmt(end) };
+}
+
 /** Under a window's bar: how usage compares with even use, then where the recent burn leads. Tap for the details. */
 function paceLine(pc, key) {
   // An untouched window is trivially in reserve; saying so on every idle lane is noise.
@@ -308,6 +321,7 @@ function renderCards(snap) {
           const sev = severity(w.usedPercent);
           const cd = countdown(w.resetAt);
           const pc = paceOf(p, w);
+          const times = windowTimes(pc, w.resetAt);
           return `
             <div class="win">
               <div class="win-top">
@@ -321,6 +335,10 @@ function renderCards(snap) {
                 <i class="fill-${sev}" style="width:${barWidth(w)}%"></i>
               </div>
               ${sparkline(pc, sev)}
+              ${times ? `<div class="win-axis mono">
+                <span title="Window started">${esc(times.start ?? "")}</span>
+                <span title="Resets">${esc(times.end)}</span>
+              </div>` : ""}
               ${paceLine(pc, `${p.id}::${w.kind}`)}
             </div>
           `;

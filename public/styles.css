@@ -267,6 +267,8 @@ body {
 .win-label { color: var(--muted); }
 .win-top b { font-weight: 640; }
 .win-sub { color: var(--muted); margin-left: 6px; }
+/* The window's time axis: start under the left edge of bar and chart, reset under the right. */
+.win-axis { display: flex; justify-content: space-between; color: var(--muted); font-size: 11px; margin-top: -2px; }
 .card-foot {
   display: flex; gap: 14px; flex-wrap: wrap;
   font-size: 12.5px; color: var(--muted);
