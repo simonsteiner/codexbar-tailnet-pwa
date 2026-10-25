@@ -646,6 +646,7 @@ function render() {
   else if (view === "cards") el.content.innerHTML = renderCards(snapshot);
   else if (view === "resets") el.content.innerHTML = renderResets(snapshot);
   else if (view === "dense") el.content.innerHTML = renderDense(snapshot);
+  el.content.dataset.view = view;
 
   const stamp = view === "spend" ? cost?.generatedAt : snapshot?.generatedAt;
   if (stamp) {
