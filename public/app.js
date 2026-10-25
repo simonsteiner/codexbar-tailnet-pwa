@@ -143,8 +143,9 @@ function span(ms) {
   const m = Math.floor(ms / 60_000);
   const h = Math.floor(m / 60);
   const d = Math.floor(h / 24);
-  if (d > 0) return `${d}d ${h % 24}h`;
-  if (h > 0) return `${h}h ${m % 60}m`;
+  // "1h", not "1h 0m": a zero tail is noise.
+  if (d > 0) return h % 24 ? `${d}d ${h % 24}h` : `${d}d`;
+  if (h > 0) return m % 60 ? `${h}h ${m % 60}m` : `${h}h`;
   return `${Math.max(1, m)}m`;
 }
 
