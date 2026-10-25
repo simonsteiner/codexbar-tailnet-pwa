@@ -40,22 +40,22 @@ const PUBLIC_DIR = path.join(HERE, "public");
 // inlines. Keeping the list here means adding an asset updates both at once.
 const STAMPED = ["app.js", "styles.css"];
 
-const PORT = Number(process.env.CBT_PORT ?? 8899);
+const PORT = envNumber("CBT_PORT", 8899, { min: 1, max: 65535, integer: true });
 const BIND = process.env.CBT_BIND ?? "127.0.0.1";
 const UPSTREAM_HOST = process.env.CBT_UPSTREAM_HOST ?? "127.0.0.1";
-const UPSTREAM_PORT = Number(process.env.CBT_UPSTREAM_PORT ?? 8087);
+const UPSTREAM_PORT = envNumber("CBT_UPSTREAM_PORT", 8087, { min: 1, max: 65535, integer: true });
 const TOKEN = process.env.CODEXBAR_DASHBOARD_TOKEN ?? "";
 // Each refresh is a live provider fetch (serve's own cache is shorter), and Claude's OAuth
 // usage endpoint started answering 429 at the old 60 s TTL (~40 calls/h). Window percentages barely move
 // in 3 minutes. Keep it under serve's staleAfterSeconds (3x its --refresh-interval).
-const CACHE_TTL_MS = Number(process.env.CBT_CACHE_TTL ?? 180) * 1000;
+const CACHE_TTL_MS = envNumber("CBT_CACHE_TTL", 180, { min: 0 }) * 1000;
 // `serve` can take a while when a provider is slow; keep this above its --request-timeout.
-const UPSTREAM_TIMEOUT_MS = Number(process.env.CBT_UPSTREAM_TIMEOUT ?? 90) * 1000;
+const UPSTREAM_TIMEOUT_MS = envNumber("CBT_UPSTREAM_TIMEOUT", 90, { min: 1 }) * 1000;
 // How long after the last client request the background poller keeps the cache warm.
 // Upstream `serve` is lazy (its --refresh-interval is only a cache TTL), so without
 // this, the first request after a quiet spell pays the full live provider fetch (~13s).
-const ACTIVE_WINDOW_MS = Number(process.env.CBT_ACTIVE_WINDOW ?? 600) * 1000;
-const POLL_MS = Number(process.env.CBT_POLL ?? 45) * 1000;
+const ACTIVE_WINDOW_MS = envNumber("CBT_ACTIVE_WINDOW", 600, { min: 0 }) * 1000;
+const POLL_MS = envNumber("CBT_POLL", 45, { min: 1 }) * 1000;
 
 const CONFIG_DIR = process.env.CBT_CONFIG_DIR ??
   (process.env.XDG_CONFIG_HOME
@@ -67,7 +67,9 @@ const WINDOW_STATE_PATH = process.env.CBT_PUSH_STATE_PATH ?? path.join(CONFIG_DI
 const HISTORY_PATH = process.env.CBT_HISTORY_PATH ?? path.join(CONFIG_DIR, "usage-history.json");
 const VAPID_SUBJECT = process.env.CBT_VAPID_SUBJECT ?? "mailto:codexbar@local";
 // A numeric env knob, or its default when unset, blank or out of range. `Number()` alone
-// turns "abc" into NaN and "" into 0, and either silently breaks renewal detection.
+// turns "abc" into NaN and "" into 0: a NaN TTL refetches every provider on every request, a
+// 0 poll interval spins, and either silently breaks renewal detection. Hoisted, so the knobs
+// above can use it.
 function envNumber(name, fallback, { min, max = Infinity, integer = false }) {
   const raw = process.env[name];
   if (raw == null || raw.trim() === "") return fallback;
