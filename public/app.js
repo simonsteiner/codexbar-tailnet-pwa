@@ -758,9 +758,11 @@ function healthRows(s) {
   }
 
   const snap = s.snapshot ? `fetched ${clock(s.snapshot.at)} (${span(s.snapshot.ageSeconds * 1000)} ago)` : "none yet";
-  const lastTry = s.upstream && !s.upstream.ok
-    ? `<br><span class="t-warn">last try ${esc(clock(s.upstream.lastErrorAt))}: ${esc(s.upstream.lastError)}</span>`
-    : "";
+  const lastTry = s.upstream?.expected
+    ? `<br><span class="t-muted">waiting for serve to come back</span>`
+    : s.upstream && !s.upstream.ok
+      ? `<br><span class="t-warn">last try ${esc(clock(s.upstream.lastErrorAt))}: ${esc(s.upstream.lastError)}</span>`
+      : "";
   rows.push(["Snapshot", esc(snap) + lastTry]);
 
   const c = s.codexbar;

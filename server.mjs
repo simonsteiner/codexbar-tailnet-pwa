@@ -729,7 +729,8 @@ function statusBody() {
   return {
     generatedAt: iso(now),
     health,
-    upstream: upstream.toJSON(),
+    // Failures while an update restarts serve are expected; the dialog shouldn't flag them.
+    upstream: { ...upstream.toJSON(), expected: updater.restarting },
     snapshot: lastGood ? { at: iso(lastGood.at), ageSeconds: Math.round((now - lastGood.at) / 1000) } : null,
     serve: serveUnit
       ? {
