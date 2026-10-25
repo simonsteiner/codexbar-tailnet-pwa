@@ -247,6 +247,8 @@ Read from `~/.config/codexbar/dashboard.env` (mode 600):
 | `CBT_PORT` | `8899` | Local listen port |
 | `CBT_BIND` | `127.0.0.1` | Keep on loopback — `tailscale serve` fronts it |
 | `CBT_UPSTREAM_PORT` | `8087` | Where `codexbar serve` listens |
+| `CBT_UPSTREAM_HOST` | `127.0.0.1` | Where `codexbar serve` listens; the proxy still sends `Host: 127.0.0.1` |
+| `CBT_CONFIG_DIR` | `$XDG_CONFIG_HOME/codexbar`, else `~/.config/codexbar` | Default directory for the state files below and `release-announced.json` |
 | `CBT_CACHE_TTL` | `180` | Snapshot cache seconds; keep below 3× `serve --refresh-interval` or rows read as stale |
 | `CBT_COST_TTL` | `300` | Spend (`/api/cost`) cache seconds |
 | `CBT_CODEXBAR_BIN` | `~/.local/bin/codexbar`, else `codexbar` on `PATH` | CLI the spend report runs; the installer pins the one it found |
