@@ -200,34 +200,58 @@ function runOut(pc) {
   return left > 0 ? `Runs out in ${span(left)}` : "Used up";
 }
 
-/** Under a window's bar: how usage compares with even use, then where the recent burn leads. */
-function paceLine(pc) {
+/** Pace details the user has expanded, by window key; the cards are rebuilt on every refresh. */
+const paceOpen = new Set();
+
+/**
+ * The expanded pace: the numbers behind the summary line, in one line. The outcome
+ * (lasts to reset / runs out in …) is already in the summary, so only the margin it
+ * leaves before the reset is added here.
+ */
+function paceDetails(pc) {
+  const used = pc.usedPercent < 1 ? "<1%" : `${Math.round(pc.usedPercent)}%`;
+  const parts = [pc.expectedUsedPercent != null
+    ? `${used} used, ${pc.expectedUsedPercent}% at even use`
+    : `${used} used`];
+  if (pc.ratePerHour != null) {
+    const last = `the last ${span(pc.lookbackMinutes * 60_000)}`;
+    const left = pc.etaSeconds > 0 ? etaLeft(pc) : 0;
+    const toReset = Date.parse(pc.resetAt) - Date.now();
+    if (!(pc.ratePerHour > 0)) parts.push(`no usage in ${last}`);
+    else parts.push(`${pc.ratePerHour}%/h over ${last}` +
+      (pc.willLastToReset === false && left > 0 && toReset > left ? `, empty ${span(toReset - left)} before reset` : ""));
+  }
+  return `<p>${esc(parts.join(" \u00b7 "))}</p>`;
+}
+
+/** Under a window's bar: how usage compares with even use, then where the recent burn leads. Tap for the details. */
+function paceLine(pc, key) {
   // An untouched window is trivially in reserve; saying so on every idle lane is noise.
   if (!(pc?.usedPercent > 0)) return "";
   const parts = [];
   if (pc.stage === "onPace") parts.push("On pace");
-  else if (pc.stage) parts.push(`${Math.abs(pc.deltaPercent)}% in ${pc.stage}`);
+  else if (pc.stage) parts.push(`${Math.abs(pc.deltaPercent)}% ${pc.stage === "deficit" ? "over" : "under"} even use`);
   const out = runOut(pc);
   if (pc.willLastToReset === true && pc.usedPercent > 0) parts.push("lasts to reset");
   if (!parts.length && !out) return "";
-  const why = [
-    pc.expectedUsedPercent != null ? `Expected ${pc.expectedUsedPercent}% used by now` : null,
-    pc.ratePerHour != null ? `burning ${pc.ratePerHour}%/h over the last ${span(pc.lookbackMinutes * 60_000)}` : null,
-  ].filter(Boolean).join(" \u00b7 ");
-  return `<div class="pace" title="${esc(why)}">${esc(parts.join(" \u00b7 "))}${
-    out ? `${parts.length ? " \u00b7 " : ""}<span class="t-warn">\u26a0 ${esc(out)}</span>` : ""}</div>`;
+  return `<details class="pace" data-pace="${esc(key)}"${paceOpen.has(key) ? " open" : ""}><summary>${esc(parts.join(" \u00b7 "))}${
+    out ? `${parts.length ? " \u00b7 " : ""}<span class="t-warn">\u26a0 ${esc(out)}</span>` : ""}</summary>${paceDetails(pc)}</details>`;
+}
+
+/** A burndown is only drawn once usage has actually moved. */
+function hasChart(pc) {
+  const used = (pc?.samples ?? []).map((s) => s[1]);
+  return used.length >= 2 && Math.max(...used) - Math.min(...used) >= 1;
 }
 
 /**
  * Burndown sparkline: recorded reserve over the cycle, against the even-use line from full at
  * the window's start to empty at its reset. Like upstream's chart, it stops at the last
- * reading rather than being drawn on to now. Omitted until usage has actually moved.
+ * reading rather than being drawn on to now.
  */
 function sparkline(pc, sev) {
-  const pts = pc?.samples ?? [];
-  if (pts.length < 2) return "";
-  const used = pts.map((s) => s[1]);
-  if (Math.max(...used) - Math.min(...used) < 1) return "";
+  if (!hasChart(pc)) return "";
+  const pts = pc.samples;
   const x0 = pc.startAt ? Date.parse(pc.startAt) : pts[0][0];
   const x1 = Date.parse(pc.resetAt);
   if (!(x1 > x0)) return "";
@@ -297,7 +321,7 @@ function renderCards(snap) {
                 <i class="fill-${sev}" style="width:${barWidth(w)}%"></i>
               </div>
               ${sparkline(pc, sev)}
-              ${paceLine(pc)}
+              ${paceLine(pc, `${p.id}::${w.kind}`)}
             </div>
           `;
         }).join("")}
@@ -589,6 +613,12 @@ el.content.addEventListener("click", (e) => {
   // Keyboard activation (detail 0): keep focus on the bar the markup was rebuilt under.
   if (e.detail === 0) el.content.querySelector(`[data-spend="${CSS.escape(id)}"][data-day="${CSS.escape(day)}"]`)?.focus();
 });
+
+// `toggle` doesn't bubble; catch it on the way down.
+el.content.addEventListener("toggle", (e) => {
+  const key = e.target.dataset?.pace;
+  if (key) e.target.open ? paceOpen.add(key) : paceOpen.delete(key);
+}, true);
 
 /* ---------------- core rendering ---------------- */
 
