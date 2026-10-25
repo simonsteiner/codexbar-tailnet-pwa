@@ -31,7 +31,7 @@ import {
 } from "./push.mjs";
 import { UsageHistory } from "./history.mjs";
 import { Updater, assetName, linuxArch } from "./updater.mjs";
-import { UpstreamHealth, ServeMonitor, parseSystemctlShow, parseVersion, compareVersions, shouldAnnounceRelease } from "./health.mjs";
+import { UpstreamHealth, ServeMonitor, parseSystemctlShow, parseVersion, compareVersions, shouldAnnounceRelease, isInstallable } from "./health.mjs";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const PUBLIC_DIR = path.join(HERE, "public");
@@ -753,7 +753,7 @@ function statusBody() {
       latest: latestRelease && (({ assets, ...rest }) => rest)(latestRelease), // assets are the updater's business
       // Installable, not merely published: the binaries land some minutes after the release does.
       updateAvailable: !!(latest && installed.version && compareVersions(latest.tag, installed.version) > 0
-        && (!installAsset(latest.tag) || latest.assets.includes(installAsset(latest.tag)))),
+        && isInstallable(latest, installAsset(latest.tag))),
     },
     proxy: { startedAt: iso(STARTED_AT), uptimeSeconds: Math.round((now - STARTED_AT) / 1000) },
   };

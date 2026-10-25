@@ -200,5 +200,8 @@ export function shouldAnnounceRelease({ latest, installed, announced, asset }) {
   if (!latest?.tag || !installed) return false;
   if (compareVersions(latest.tag, installed) <= 0) return false;
   if (announced && compareVersions(latest.tag, announced) <= 0) return false;
-  return !asset || (latest.assets ?? []).includes(asset);
+  return isInstallable(latest, asset);
 }
+
+/** Whether `latest` has this box's CLI tarball attached yet; true when there is none to look for. */
+export const isInstallable = (latest, asset) => !asset || (latest?.assets ?? []).includes(asset);
