@@ -82,7 +82,9 @@ body {
   background: var(--bg); border: 1px solid var(--line); border-radius: 10px;
   font: 11.5px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace; color: var(--muted);
   white-space: pre-wrap; overflow-wrap: anywhere;
+  display: grid; grid-template-columns: auto 1fr; column-gap: 2ch;
 }
+.job-log .log-at { white-space: nowrap; }
 
 .topbar-actions {
   display: flex;

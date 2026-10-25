@@ -809,8 +809,9 @@ function healthActions(s) {
   if (job) {
     const [cls, text] = jobHeadline(job);
     parts.push(`<div class="job-state${cls ? ` ${cls}` : ""}">${esc(text)}</div>`);
-    const lines = job.log.map((l) => `${clock(l.at)}  ${l.msg}`).join("\n");
-    parts.push(`<pre class="job-log">${esc(lines)}</pre>`);
+    // One grid row per entry, so a wrapped message stays in its column under itself.
+    const lines = job.log.map((l) => `<span class="log-at">${esc(clock(l.at))}</span><span>${esc(l.msg)}</span>`).join("");
+    parts.push(`<pre class="job-log">${lines}</pre>`);
   }
   if (!busy && s.codexbar.updateAvailable && latest?.tag) {
     // Just switched away from the latest on purpose: offer the way back, without the big button.

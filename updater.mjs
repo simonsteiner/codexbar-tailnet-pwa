@@ -284,7 +284,7 @@ export class Updater {
     // Cold on purpose: an empty cache forces the full log scan, which is the path that crashed.
     const cache = await fs.mkdtemp(path.join(os.tmpdir(), "codexbar-smoke-"));
     try {
-      this.#log(job, "smoke test: cold cost scan (takes ~30 s)…");
+      this.#log(job, "smoke test: cold cost scan (takes ~30\u00a0s)…");
       const t0 = Date.now();
       const { stdout: out } = await run(bin, ["cost", "--days", "90", "--format", "json"], {
         timeout: SMOKE_TIMEOUT_MS,
