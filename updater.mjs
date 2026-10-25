@@ -114,6 +114,8 @@ export class Updater {
       settleMs: SETTLE_MS, verifyTimeoutMs: VERIFY_TIMEOUT_MS, pollMs: 3000, ...o,
     });
     this.job = null;
+    /** True while this updater is restarting serve and waiting for it: a dead port is expected then. */
+    this.restarting = false;
   }
 
   /** Why this box can't be updated from here, or null when it can. */
@@ -351,7 +353,16 @@ export class Updater {
     return parseSystemctlShow(stdout);
   }
 
-  async #restartAndVerify(job, { settleMs = this.settleMs } = {}) {
+  async #restartAndVerify(job, opts) {
+    this.restarting = true;
+    try {
+      await this.#restartAndSettle(job, opts);
+    } finally {
+      this.restarting = false;
+    }
+  }
+
+  async #restartAndSettle(job, { settleMs = this.settleMs } = {}) {
     this.quiet(Date.now() + this.verifyTimeoutMs + settleMs);
     await run(this.systemctl, ["--user", "restart", this.serveUnit], { timeout: 60_000 });
     const start = Date.now();

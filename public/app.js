@@ -745,7 +745,7 @@ function healthRows(s) {
   const rows = [];
   const h = s.health;
   rows.push(["Health", h.level === "ok"
-    ? `<span class="t-ok">All good</span>`
+    ? (h.reason ? esc(h.reason) : `<span class="t-ok">All good</span>`)
     : `<span class="${h.level === "down" ? "t-crit" : "t-warn"}">${esc(h.reason)}</span>${h.since ? ` · since ${esc(clock(h.since))}` : ""}`]);
 
   const u = s.serve;

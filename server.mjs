@@ -722,9 +722,14 @@ function statusBody() {
   // The monitor samples once a minute; a refresh that failed since then already counts.
   const level = monitor.level === "ok" && upstream.down ? "warn" : monitor.level;
   const latest = latestRelease?.tag ? latestRelease : null;
+  // An update restarting serve: the port is closed and the first snapshot is a cold one
+  // (~25 s), which is no outage. The updater judges the restart itself and rolls back.
+  const health = updater.restarting
+    ? { level: "ok", reason: "serve is restarting for the update", since: null }
+    : { level, reason: monitor.reason ?? (upstream.down ? `serve isn't answering (${upstream.lastError})` : null), since: iso(monitor.degradedSince ?? upstream.downSince) };
   return {
     generatedAt: iso(now),
-    health: { level, reason: monitor.reason ?? (upstream.down ? `serve isn't answering (${upstream.lastError})` : null), since: iso(monitor.degradedSince ?? upstream.downSince) },
+    health,
     upstream: upstream.toJSON(),
     snapshot: lastGood ? { at: iso(lastGood.at), ageSeconds: Math.round((now - lastGood.at) / 1000) } : null,
     serve: serveUnit
@@ -944,9 +949,11 @@ async function serveStatic(req, res, urlPath) {
 }
 
 // What the phone needs to say "serve has been down since 00:21" instead of spinning: set
-// whenever the last refresh failed, even if a retry is already in flight.
-function upstreamHeaders(err) {
+// whenever the last refresh failed, even if a retry is already in flight. Not while an update
+// is restarting serve, as long as there is data to show: that outage is expected and short.
+function upstreamHeaders(err, { body = true } = {}) {
   if (!upstream.down && !err) return {};
+  if (updater.restarting && body) return {};
   return {
     "X-Snapshot-Stale": "true",
     "X-Snapshot-Error": String(upstream.lastError ?? err?.message ?? "").replace(/[^\x20-\x7e]/g, "?").slice(0, 200),
@@ -1107,7 +1114,7 @@ const server = http.createServer(async (req, res) => {
         }, lastGood.body, shouldGzip(req, json, Buffer.byteLength(lastGood.body)));
         return;
       }
-      res.writeHead(502, { "Content-Type": "application/json", "Cache-Control": "no-store", ...upstreamHeaders(err) });
+      res.writeHead(502, { "Content-Type": "application/json", "Cache-Control": "no-store", ...upstreamHeaders(err, { body: false }) });
       res.end(JSON.stringify({ error: "upstream_unavailable", detail: String(err.message), upstream: upstream.toJSON() }));
     }
     return;

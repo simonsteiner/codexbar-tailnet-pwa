@@ -121,6 +121,7 @@ esac
 
     let changes = 0;
     let quietUntil = 0;
+    let restartingSeen = false;
     const u = new Updater({
       installRoot: root,
       binLink: link,
@@ -128,7 +129,7 @@ esac
       repo: "owner/repo",
       fetch: fakeFetch,
       systemctl,
-      verifyServe: async () => {},
+      verifyServe: async () => { restartingSeen ||= u.restarting; },
       quiet: (t) => { quietUntil = t; },
       onChange: () => { changes += 1; },
       settleMs: 300,
@@ -154,6 +155,7 @@ esac
       assert.strictEqual(job.from, "0.1.0");
       assert.strictEqual(await active(), "0.2.0");
       assert.ok(changes >= 1 && quietUntil > Date.now(), "proxy told about the switch and the restart");
+      assert.ok(restartingSeen && !u.restarting, "restarting only while serve is being restarted");
       assert.deepStrictEqual(await leftovers(), [], "download and staging dirs are cleaned up");
       assert.ok(job.log.some((l) => /smoke test ok/.test(l.msg)));
       console.log("✓ Test 2 passed: good release installed");
