@@ -780,12 +780,17 @@ function healthRows(s) {
   return rows.map(([k, v]) => `<dt>${k}</dt><dd>${v}</dd>`).join("");
 }
 
-const JOB_STATE = {
-  running: ["t-warn", "Working…"],
-  succeeded: ["t-ok", "Done"],
-  failed: ["t-crit", "Failed — nothing was changed"],
-  "rolled-back": ["t-crit", "Rolled back — serve wasn't healthy on the new version"],
-};
+/** The job as one phrase whose tense follows it: "Installing v0.81.0…", then "Installed v0.81.0". */
+function jobHeadline(job) {
+  const update = job.action === "update";
+  switch (job.state) {
+    case "running": return ["", `${update ? "Installing" : "Switching to"} ${job.target}…`];
+    case "succeeded": return ["t-ok", `${update ? "Installed" : "Switched to"} ${job.target}`];
+    case "failed": return ["t-crit", `Couldn't ${update ? "install" : "switch to"} ${job.target}; nothing was changed`];
+    case "rolled-back": return ["t-crit", `Back on ${job.from}: serve wasn't healthy on ${job.target}`];
+    default: return ["", `${job.state}: ${job.target}`];
+  }
+}
 
 /** Update / switch-version controls, for whoever the proxy says may use them. */
 function healthActions(s) {
@@ -800,9 +805,8 @@ function healthActions(s) {
   const busy = job?.state === "running";
   const parts = [];
   if (job) {
-    const [cls, label] = JOB_STATE[job.state] ?? ["", job.state];
-    const what = job.action === "update" ? `Install ${job.target}` : `Switch to ${job.target}`;
-    parts.push(`<div class="job-state"><span class="${cls}">${esc(label)}</span> · ${esc(what)}</div>`);
+    const [cls, text] = jobHeadline(job);
+    parts.push(`<div class="job-state${cls ? ` ${cls}` : ""}">${esc(text)}</div>`);
     const lines = job.log.map((l) => `${clock(l.at)}  ${l.msg}`).join("\n");
     parts.push(`<pre class="job-log">${esc(lines)}</pre>`);
   }
