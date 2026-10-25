@@ -256,6 +256,10 @@ async function runTests() {
       assert.ok(st.snapshot.at);
       assert.strictEqual(st.admin.allowed, false, "no tailnet identity on a direct request");
 
+      // A malformed %-escape is the client's mistake, not a reason for the process to exit.
+      assert.strictEqual((await get(port, "/%E0%A4%A")).status, 400);
+      assert.strictEqual((await get(port, "/api/health")).status, 200, "proxy survived a malformed path");
+
       // Admin routes: POST only, same-origin only, and only for a listed tailnet login.
       const post = (headers) => fetch(`http://127.0.0.1:${port}/api/admin/update`, {
         method: "POST", headers: { "Content-Type": "application/json", ...headers }, body: JSON.stringify({ tag: "v0.79.0" }),

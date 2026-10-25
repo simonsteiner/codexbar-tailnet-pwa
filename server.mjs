@@ -902,7 +902,13 @@ async function readJsonBody(req) {
 }
 
 async function serveStatic(req, res, urlPath) {
-  const rel = urlPath === "/" ? "index.html" : decodeURIComponent(urlPath).replace(/^\/+/, "");
+  let rel;
+  try {
+    rel = urlPath === "/" ? "index.html" : decodeURIComponent(urlPath).replace(/^\/+/, "");
+  } catch {
+    res.writeHead(400, { "Content-Type": "text/plain" }).end("bad request"); // malformed %-escape
+    return;
+  }
   const full = path.join(PUBLIC_DIR, rel);
   // Contain traversal: the resolved path must stay inside PUBLIC_DIR.
   if (!full.startsWith(PUBLIC_DIR + path.sep) && full !== path.join(PUBLIC_DIR, "index.html")) {
@@ -962,7 +968,7 @@ function upstreamHeaders(err, { body = true } = {}) {
   };
 }
 
-const server = http.createServer(async (req, res) => {
+async function handleRequest(req, res) {
   const urlPath = (req.url ?? "/").split("?")[0];
 
   if (urlPath === "/api/health") {
@@ -1151,6 +1157,17 @@ const server = http.createServer(async (req, res) => {
     return;
   }
   await serveStatic(req, res, urlPath);
+}
+
+// A throw in a route must cost one request, not the process: an unhandled rejection exits node,
+// which drops the caches and the history since its last save, and orphans a running update job
+// between swapping the binary and checking serve on it.
+const server = http.createServer((req, res) => {
+  handleRequest(req, res).catch((err) => {
+    console.warn(`${req.method} ${req.url}: ${err.stack ?? err}`);
+    if (!res.headersSent) res.writeHead(500, { "Content-Type": "text/plain", "Cache-Control": "no-store" }).end("internal error");
+    else res.destroy();
+  });
 });
 
 server.listen(PORT, BIND, () => {
