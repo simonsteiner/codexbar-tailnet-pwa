@@ -719,14 +719,13 @@ async function sampleHealth() {
 /** Everything the status pill and dialog show. Synchronous: it reads what the probes cached. */
 function statusBody() {
   const now = Date.now();
-  // The monitor samples once a minute; a refresh that failed since then already counts.
-  const level = monitor.level === "ok" && upstream.down ? "warn" : monitor.level;
   const latest = latestRelease?.tag ? latestRelease : null;
   // An update restarting serve: the port is closed and the first snapshot is a cold one
   // (~25 s), which is no outage. The updater judges the restart itself and rolls back.
+  const view = monitor.view({ at: now, unit: serveUnit, upstream });
   const health = updater.restarting
     ? { level: "ok", reason: "serve is restarting for the update", since: null }
-    : { level, reason: monitor.reason ?? (upstream.down ? `serve isn't answering (${upstream.lastError})` : null), since: iso(monitor.degradedSince ?? upstream.downSince) };
+    : { ...view, since: iso(view.since) };
   return {
     generatedAt: iso(now),
     health,

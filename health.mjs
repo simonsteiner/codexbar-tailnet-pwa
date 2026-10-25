@@ -139,20 +139,7 @@ export class ServeMonitor {
       this.restartSamples.push([at, unit.restarts]);
       this.restartSamples = this.restartSamples.filter(([t]) => at - t <= LOOP_WINDOW_MS);
     }
-    const oldest = this.restartSamples[0];
-    const recentRestarts = oldest ? unit.restarts - oldest[1] : 0;
-
-    // Restarts first: between crashes the unit reads "activating (auto-restart)", which on its
-    // own is just a unit starting up.
-    let reason = null;
-    if (recentRestarts >= LOOP_RESTARTS) {
-      reason = `serve is crash-looping: ${recentRestarts} restarts in ${Math.round(LOOP_WINDOW_MS / 60_000)} min`;
-    } else if (unit?.activeState === "inactive" || unit?.activeState === "failed") {
-      reason = `serve unit is ${unit.activeState}${unit.result && unit.result !== "success" ? ` (${unit.result})` : ""}`;
-    } else if (upstream.down) {
-      reason = `serve isn't answering (${upstream.lastError})`;
-    }
-
+    const { reason } = this.#reason(at, unit, upstream);
     let event = null;
     if (reason) {
       this.degradedSince ??= upstream.downSince ?? at;
@@ -170,6 +157,37 @@ export class ServeMonitor {
     }
     this.reason = reason;
     return { level: this.level, reason, event };
+  }
+
+  /**
+   * Health as of now, for display, without touching the alert state. The last `sample()` can
+   * be a minute old: one taken mid-restart would otherwise still say "isn't answering" after
+   * serve is back.
+   * @returns {{level: "ok"|"warn"|"down", reason: string|null, since: number|null}}
+   */
+  view({ at, unit, upstream }) {
+    const { reason, port } = this.#reason(at, unit, upstream);
+    if (!reason) return { level: "ok", reason: null, since: null };
+    // A dead port has its own start; `degradedSince` may belong to an outage that has ended
+    // since the last sample.
+    const since = (port ? upstream.downSince : this.degradedSince) ?? at;
+    return { level: at - since >= this.alertAfterMs ? "down" : "warn", reason, since };
+  }
+
+  /** What's wrong, if anything; `port` when it's only that serve doesn't answer. */
+  #reason(at, unit, upstream) {
+    const oldest = this.restartSamples.find(([t]) => at - t <= LOOP_WINDOW_MS);
+    const recentRestarts = oldest && unit?.restarts != null ? unit.restarts - oldest[1] : 0;
+    // Restarts first: between crashes the unit reads "activating (auto-restart)", which on its
+    // own is just a unit starting up.
+    if (recentRestarts >= LOOP_RESTARTS) {
+      return { reason: `serve is crash-looping: ${recentRestarts} restarts in ${Math.round(LOOP_WINDOW_MS / 60_000)} min` };
+    }
+    if (unit?.activeState === "inactive" || unit?.activeState === "failed") {
+      return { reason: `serve unit is ${unit.activeState}${unit.result && unit.result !== "success" ? ` (${unit.result})` : ""}` };
+    }
+    if (upstream.down) return { reason: `serve isn't answering (${upstream.lastError})`, port: true };
+    return { reason: null };
   }
 }
 

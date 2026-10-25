@@ -135,6 +135,28 @@ async function runTests() {
     console.log("✓ Test 6 passed: unit state, quiet window, notify off");
   }
 
+  // 6a: monitor view — reads now, not the last sample, and never moves the alert state
+  {
+    const MIN = 60_000;
+    const m = new ServeMonitor({ alertAfterMs: 5 * MIN });
+    const up = new UpstreamHealth();
+    const unit = { activeState: "active", restarts: 0 };
+    up.fail(new Error("connect ECONNREFUSED"), T0);
+    assert.strictEqual(m.sample({ at: T0 + 10_000, unit, upstream: up }).level, "warn", "sampled mid-restart");
+    up.ok(T0 + 30_000);
+    assert.deepStrictEqual(m.view({ at: T0 + 31_000, unit, upstream: up }), { level: "ok", reason: null, since: null },
+      "serve answered since the sample: the view is clean");
+    assert.strictEqual(m.level, "warn", "the alert state waits for the next sample");
+    up.fail(new Error("upstream timeout"), T0 + MIN);
+    const v = m.view({ at: T0 + 7 * MIN, unit, upstream: up });
+    assert.strictEqual(v.since, T0 + MIN, "dated from this outage, not the sampled one");
+    assert.strictEqual(v.level, "down");
+    assert.match(v.reason, /upstream timeout/);
+    assert.strictEqual(m.view({ at: T0 + 7 * MIN, unit: { activeState: "failed", result: "signal", restarts: 0 }, upstream: new UpstreamHealth() }).reason,
+      "serve unit is failed (signal)");
+    console.log("✓ Test 6a passed: view is live and side-effect free");
+  }
+
   // 6b: release pushes — once per newer tag, and only once the Linux CLI is attached
   {
     const asset = "CodexBarCLI-v0.80.0-linux-x86_64.tar.gz";
