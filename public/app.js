@@ -744,8 +744,10 @@ function healthRows(s) {
   if (!s) return `<dt>Health</dt><dd>Unknown — the proxy hasn't answered yet.</dd>`;
   const rows = [];
   const h = s.health;
+  // While an update runs, its log is where the story is; say so once instead of retelling it.
+  const updating = s.admin?.job?.state === "running";
   rows.push(["Health", h.level === "ok"
-    ? (h.reason ? esc(h.reason) : `<span class="t-ok">All good</span>`)
+    ? (updating ? "Updating CodexBar, see below" : h.reason ? esc(h.reason) : `<span class="t-ok">All good</span>`)
     : `<span class="${h.level === "down" ? "t-crit" : "t-warn"}">${esc(h.reason)}</span>${h.since ? ` · since ${esc(clock(h.since))}` : ""}`]);
 
   const u = s.serve;
